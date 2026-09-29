@@ -1,0 +1,45 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(/apps/pipeline/config/local/config.yaml)",
+      "Edit(/apps/pipeline/config/local/config.yaml)"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "autoAllowBashIfSandboxed": false,
+    "network": {
+      "allowLocalBinding": true
+    },
+    "filesystem": {
+      "denyRead": ["apps/pipeline/config/local/config.yaml"],
+      "denyWrite": ["apps/pipeline/config/local/config.yaml"]
+    }
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read|Edit|Write|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/hide-user-owned-files.sh",
+            "timeout": 10,
+            "statusMessage": "Hides user owned files"
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/block-app-docs.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

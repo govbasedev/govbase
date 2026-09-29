@@ -1,0 +1,10 @@
+# Each app is its own git repository. The workspace never tracks them.
+apps/*/
+
+# Installed dependencies, at any depth.
+node_modules/
+
+# Local Claude Code settings are per machine.
+.claude/settings.local.json
+
+.DS_Store
