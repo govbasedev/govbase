@@ -1,3 +1,0 @@
-# Score against item truth, and use state truth only to find the cause of errors
-
-Each label records two answers: item truth, the answer for the real item with the whole documents available, and state truth, the answer from only the evidence the model was sent. Pass marks use item truth. We chose this because the keyword baseline searches the whole documents and the analyst cares about the real item, so scoring on state truth would judge the two methods against different answers. State truth is kept to split each error into "the evidence was missing" and "the model was wrong", which tells us whether to send more evidence or to change the question.
