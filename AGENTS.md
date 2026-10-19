@@ -5,12 +5,13 @@ folders. `apps/` holds independent app repositories side by
 side so an agent can work across them. `docs/` holds the shared design
 documents.
 
-| Folder            | GitHub repository | Language           |
-| ----------------- | ----------------- | ------------------ |
-| `apps/pipeline`   | pipeline          | TypeScript, on Bun |
-| `apps/parser-sdk` | parser-sdk        | TypeScript, on Bun |
-| `apps/browser`    | browser           | TypeScript, on Bun |
-| `apps/relay`      | relay             | nginx config, bash |
+| Folder                 | GitHub repository | Language           |
+| ---------------------- | ----------------- | ------------------ |
+| `apps/pipeline`        | pipeline          | TypeScript, on Bun |
+| `apps/parser-sdk`      | parser-sdk        | TypeScript, on Bun |
+| `apps/browser`         | browser           | TypeScript, on Bun |
+| `apps/relay`           | relay             | nginx config, bash |
+| `apps/document-viewer` | document-viewer   | JavaScript, on Bun |
 
 Each app folder is its own git repository. The workspace repository
 ignores them. The workspace tracks this file, `README.md`, `Makefile`,
@@ -53,6 +54,13 @@ working folder or above it. `make check-agents` fails if one appears.
    rule for agents only. It is not a code standard for the people who
    work in these repositories. Each app has its own lint rules for
    comments, and those rules decide what a human may write.
+
+## The name
+
+The product is named Govbase. Write `Govbase` in text, titles,
+dashboards, alerts and messages. Write `govbase` where lowercase is
+needed, such as in a host name, a package name, a metric name, a label
+or a file path. Never write `GovBase` or any other spelling.
 
 ## Conventions every app follows
 

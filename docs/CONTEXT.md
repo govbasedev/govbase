@@ -155,3 +155,53 @@ _Avoid_: notification, ping
 **Keyword baseline**:
 A fixed keyword rule that answers the same question as a judgment, used to test whether judgments are better.
 _Avoid_: keyword search, regex match
+
+## Pipeline
+
+**Step**:
+One stage of the pipeline that runs on its own interval and owns one store: list, read, ocr, judge, plan, send.
+_Avoid_: worker, worker pool, service
+
+**Run**:
+One pass of one step, started on its interval, over what its store holds. There is no run of the whole pipeline.
+_Avoid_: tick, pass, cycle, job
+
+**Store**:
+The place a step writes its results, and the only way steps hand work to each other. Each step owns one store and writes nowhere else.
+_Avoid_: ledger, database, queue
+
+**Outcome**:
+The latest record of a document or council in a step's store, replaced on each attempt.
+_Avoid_: state, status
+
+**Event**:
+One note of one change in a step's store, never replaced, kept for history.
+_Avoid_: log entry, audit row
+
+**Pending scan**:
+A document whose page images have not yet been read.
+_Avoid_: OCR job, backlog item
+
+**Changed council**:
+A council whose listing differs from the last one read.
+_Avoid_: dirty, stale, touched
+
+**Lost council**:
+A council with no listing for longer than the lost period.
+_Avoid_: failed, down, unreachable
+
+**First listing**:
+The first time a council is listed, when meetings older than the first-listing cap are left out.
+_Avoid_: backfill, initial crawl, onboarding
+
+**Share**:
+One of the equal parts of the pending scans that one OCR process takes.
+_Avoid_: slot, shard, partition
+
+**Heartbeat**:
+The time of a step's last run, sent as a metric from the run itself, so a hang makes it stale.
+_Avoid_: liveness, ping
+
+**Alarm**:
+A Grafana rule that has fired about the pipeline, the browser or the relay. An alert is a message to an analyst, never this.
+_Avoid_: alert, notification
