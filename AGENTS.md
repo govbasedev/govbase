@@ -54,6 +54,11 @@ working folder or above it. `make check-agents` fails if one appears.
    rule for agents only. It is not a code standard for the people who
    work in these repositories. Each app has its own lint rules for
    comments, and those rules decide what a human may write.
+10. Documentation always goes in the workspace `docs/` folder, as a
+    markdown file in this repository. Never write it as a hosted
+    artifact, such as a Claude Doc or a claude.ai page. When the user
+    asks for a doc, an explanation to keep, or notes on code, write
+    a file in `docs/`, and give the user its path.
 
 ## The name
 
