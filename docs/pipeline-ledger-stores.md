@@ -1,10 +1,10 @@
-# Ledger stores: run the pipeline again and again, and never lose a fact
+# Stores with history: run the pipeline again and again, and never lose a fact
 
-Written 27 October 2026. Pipeline at `0f670e6`, parser SDK at `da01731`, Bun 1.4.2. It answers the gaps in `pipeline-daily-rerun-gaps.md` with one design. It keeps ADR 0001 (stores in object storage, no database) and ADR 0002 (one process per step). Nothing here is built.
+Written 28 October 2026. Pipeline at `0f670e6`, parser SDK at `da01731`, Bun 1.4.2. It answers the gaps in `pipeline-daily-rerun-gaps.md` with one design. It keeps ADR 0001 (stores in object storage, no database) and ADR 0002 (one process per step). Nothing here is built.
 
 **The ask**
 
-Run the pipeline often. Never overwrite data. Add to it. Mark a thing as gone, but never delete it. Keep an audit trail: what was made, added or marked gone, and when. And:
+Run the pipeline often. Never lose data. Add to it. Mark a thing as gone, but never delete it. Keep an audit trail: what was made, added or marked gone, and when. And:
 
 - A) Cast the net wide. List and read events and documents from far back and from many pages, without fear.
 - B) Make reading the data very fast.
@@ -12,691 +12,437 @@ Run the pipeline often. Never overwrite data. Add to it. Mark a thing as gone, b
 
 **Words used in this doc**
 
-- **Fact**: one small JSON object that says one thing happened, such as "run R saw meeting M with these papers". A fact is written once and never changed.
+- **Object**: one JSON file about one thing, at a fixed key, as today. It is rewritten only when the thing changes, and the new version holds everything the old one held plus the change.
+- **Link**: the object that ties one document to one event. It sits beside the event, at `events/data/<eventId>/documents/<documentId>.json`.
+- **History**: a list on an event or a link of what happened to it and in which run: `created`, `updated`, `archived`, `unarchived`, and for an event which document comes first. Each entry has a `kind`, so a reader switches on it.
 - **Run id**: a name for one run of one step. It starts with the start time, so run ids sort in time order. Example: `20261027T061500Z-k3f9qa`.
-- **Run chunk**: one file that holds the facts one run wrote, in order, a few hundred at a time.
-- **Ledger**: every run chunk of one store. It is the whole history of that store.
-- **Fold**: to read the facts of one thing in time order and work out its current state. A fold is a pure function: same facts in, same state out.
-- **History**: the list on each folded thing of the facts that made it: run id, fact kind, and the chunk that holds the fact.
-- **Snapshot**: the folded state of every thing in a store, saved as one file or a few. It is a cache. It can always be built again from the ledger.
-- **Head**: one tiny file per store that names the newest snapshot and the runs folded into it. It is the only object a step writes over.
+- **ETag**: a tag the bucket gives every object and returns in a listing. It changes when the object's bytes change, and only then. Comparing ETags finds changed objects with no GET and no clock.
+- **Snapshot**: one file per store that holds a copy of every object in it, with the object's ETag. It is a cache. It can always be built again from the objects.
+- **Share run**: one task of a cloud job that does part of a step's work. It writes objects and no snapshot.
 - **Content hash**: the SHA-256 of a file's bytes. The same bytes always give the same hash.
-- **Tombstone**: a fact that says a thing is gone. It hides the thing. It removes nothing.
 - **Validator**: a header a web server sends with a file, `ETag` or `Last-Modified`. A later request sends it back to ask "has it changed?".
-- **Delimiter**: a listing option that groups keys by one character. A listing of `runs/` with the delimiter `/` returns one entry per run, not every file.
-- **Shard**: one slice of a snapshot, picked by the first hex characters of the thing's id. A snapshot starts as one shard.
 
 ## 1. The design in one page
 
-Three kinds of object, plus two tiny markers.
+Today's stores, with four changes.
 
-| Kind | What it is | Written how | Example key |
-| --- | --- | --- | --- |
-| Run chunk | The facts one run wrote, in order | Once. The run id is in the key, so two runs can never write the same key. | `list/v3/runs/<runId>/0001.json` |
-| Content | Bytes, text and images, named by what they are | Once. The key is the content hash, so the same bytes are never saved twice. | `read/v3/blobs/<contentHash>` |
-| Snapshot | The current state of every thing, folded from the facts | A new one each run, named by run id. The head points at it. | `list/v3/snapshot/<runId>/all.json` |
-| Done marker | Says a run finished, and how many chunks it wrote | Once, as the last write of a run. | `list/v3/runs/<runId>.done` |
-| Head | Names the newest snapshot and the runs folded into it | Written over. The only object that is. | `list/v3/snapshot/HEAD.json` |
+1. **Documents leave the event.** The event object holds the meeting's own facts and its history, which also names its first document. Each document of a meeting is its own small link object beside the event, with a pointer to the next document. Adding a paper adds one object and rewrites at most the link before it. The event is rewritten for a document only when the first document changes, which is rare.
+2. **Every object carries its history.** An object is rewritten only when its thing changes, and the new version holds everything the old one held plus the change. A removed document is not deleted: its link gets an `archived` entry. Nothing is ever lost.
+3. **Every object carries its `id`.** It is there so a migration can move an object and still know what it is about. A record that has an error object beside it, and the error object, also carry the `runId` that last wrote them, so the newer of the two wins. An event and a link carry their runs in `history` instead.
+4. **One snapshot per store, refreshed by ETag.** A step lists the store, sixteen prefixes at once, compares each key's ETag with the one in its snapshot, and GETs only the keys that are new or changed. No step reads the bucket's modified times. No step GETs an object it already has.
 
-Rules:
+Carried over from the redesign:
 
-1. **A fact is never overwritten.** It lives in a run chunk, and the run id is in the chunk key. A change is a new fact. A removal is a tombstone fact. The audit trail is the ledger, and each folded thing carries its history, so one read answers "what happened to this, in order".
-2. **Content is named by its hash.** A changed council file gets a new hash, so it is new content. Parse text is keyed by content hash and SDK version. OCR text is keyed by content hash, SDK version, engine version and pages read. An upgrade is a new key, so it flows down with no special code.
-3. **No step reads the bucket's last-modified time, and no step lists a big folder.** A step reads the snapshot of the step before it, its own snapshot, and one listing of the run folders. The snapshot is the only thing that must be fast, so it is the only thing tuned for speed.
-4. **Nothing in the bucket is compressed.** Every chunk, snapshot and fact is plain JSON, and every text is plain markdown, so a person can read any object as it is, with one fetch.
-5. **One maker builds every store.** `createLedgerStore` gives each step `appendFact`, `readSnapshot` and `saveSnapshot`, and runs the fold. A step adds only its fact body schema, its reducer and its due rule.
-6. **The one-writer rule stays.** A step writes only inside its own store, and reads only the stores of earlier steps. `stepsOwnTheirStores.test.mjs` still holds.
+- **Content is named by its hash and version**, and written once. Parse text is keyed by content hash and SDK version. OCR text by content hash, SDK version, engine version and the count of pages read. An upgrade is a new key, so it flows down with no special code.
+- **Runs of one step never overlap.** Decision 2 of the redesign says a step skips a run while the last one is still going, and `runStep.sh` runs a cloud job's share runs and then one single run.
+- **The one-writer rule stays.** A step writes only inside its own store, and reads only the stores of earlier steps. `stepsOwnTheirStores.test.mjs` still holds.
+- **Rules live in code**, not in config. Config holds knobs.
 
-Picture of one store:
+What this design gives up: an object's old versions. The title a meeting had before a correction is not kept, only the current one. The runs in which a thing was added and removed are kept, in its history.
+
+Picture of the list store and the parse store:
 
 ```
+list/v3/
+  events/data/<eventId>.json                 the meeting: id, source, title, date, url, history
+  events/data/<eventId>/documents/<documentId>.json   one link per document: id, title, url, next document, history
+  events/errors/<pageId>.json                the last failure of a page, as today
+  snapshot/<runId>.json
+
 parse/v4/
-  runs/<runId>/0001.json           the ledger: the facts the run wrote, in order
-  runs/<runId>/attempted/<id>.json    one fact written at once, before each parse
-  runs/<runId>.done                   { chunkCount, attemptedCount, finishedAtUnixMs }
-  text/<contentHash>/<sdkVersion>.md  content
-  images/<contentHash>/<file>.png     content
-  snapshot/<runId>/all.json        the folded state, one shard to start
-  snapshot/HEAD.json                  { runId, shardCount, shards, foldedRuns }
+  documents/data/<documentId>.json
+  documents/errors/<documentId>.json
+  documents/text/<documentId>/<contentHash>/<sdkVersion>.md
+  documents/images/<documentId>/<contentHash>/<file>.png
+  snapshot/<runId>.json
 ```
 
 ## 2. The shapes
 
-Every file and every fact in this design has one of the shapes below. They are written as JSON. A type sits in angle brackets, a choice has a bar between the options, and `n` is a number. Every field is present in every object. A field with no value is `null`. `createLedgerStore.schema.ts` holds the shared shapes. Each step's `.schema.ts` holds its own fact bodies and its folded state.
+Eight shapes. Every object starts with `id`, the thing it is about. The read, parse, OCR and join records and the error object also carry `runId`, the run that last wrote them, so the newer of a record and its error can be told. An event and a link carry their runs in `history`. A type sits in angle brackets, a bar separates choices, and `n` is a number. Every field is present. A field with no value is `null`. No object carries a schema version: the folder version does, as today. Today's objects are in 2.9, for comparison.
 
-### 2.1 Files
+The event and the link share one history entry. It is a union on `kind`. The first entry of a history is always `created`. A meeting or a document is current when the last of its `created`, `archived` and `unarchived` entries is not `archived`. The chain of a meeting starts at the `documentId` of its last `first-document` entry.
 
-**A chunk**, `runs/<runId>/<nnnn>.json`. One JSON object. The facts are in the order the run wrote them. `<nnnn>` is a four-digit counter that starts at `0001` and is the same number as `chunkIndex`. The zeros on the front keep a listing in write order.
+```
+{ "kind": "created" | "updated" | "archived" | "unarchived", "runId": "<runId>" }
+{ "kind": "first-document", "runId": "<runId>", "documentId": "<documentId>" }
+```
+
+### 2.1 Event
+
+`list/v3/events/data/<eventId>.json`
+
+Written when the meeting is first seen, with a `created` entry. Rewritten only when something happens to the meeting itself, and each time one entry is added: `updated` when `title`, `date` or `url` change, `archived` when the meeting is gone from a page that loaded fine, `unarchived` when it is back, and `first-document` when the first document of the chain in 2.2 is set or changes. The first document is the meeting page, whose id is the hash of `url`, as today. For a source with no meeting page it is the first paper the source lists. A new paper never rewrites the event unless it becomes the first. Nothing at the top of the object changes without an entry that says when.
 
 ```
 {
-  "schemaVersion": 1,
-  "runId": "<runId>",
-  "chunkIndex": n,
-  "facts": [ <Fact> ]
-}
-```
-
-**An `attempted` object**, `runs/<runId>/attempted/<subjectId>.json`. One `<Fact>` with `factKind` `attempted`, written before the work starts.
-
-**A done marker**, `runs/<runId>.done`. The last write of a run.
-
-```
-{
-  "schemaVersion": 1,
-  "runId": "<runId>",
-  "chunkCount": n,
-  "attemptedCount": n,
-  "factCount": n,
-  "finishedAtUnixMs": n
-}
-```
-
-**A head**, `snapshot/HEAD.json`. `shards` maps each shard to the run id whose folder holds its newest file, so the head is the manifest from the first day. With one shard the map has one entry, `all`. `foldedRuns` says how much of each run the snapshot holds.
-
-```
-{
-  "schemaVersion": 1,
-  "runId": "<runId>",
-  "shardCount": n,
-  "shards": { "all" | "<hex prefix>": "<runId>" },
-  "foldedRuns": { "<runId>": { "chunkCount": n, "attemptedCount": n } }
-}
-```
-
-**A snapshot shard**, `snapshot/<runId>/<shard>.json`. One JSON object. `things` is keyed by subject kind, then by id. The subject kinds of a store are the things its fold produces: `source` and `event` in list, `document` in read, parse and OCR, `event` in join.
-
-```
-{
-  "schemaVersion": 1,
-  "store": "<step>/v<n>",
-  "runId": "<runId>",
-  "shard": "all" | "<hex prefix>",
-  "things": {
-    "<subject kind>": { "<id>": <FoldedThing> }
-  }
-}
-```
-
-**A folded thing.** The envelope is the same in every store. `state` is what the step's reducer makes, section 2.4. `history` is in observation order, oldest first.
-
-```
-{
-  "id": "<id>",
-  "kind": "source" | "event" | "document",
-  "history": [
-    {
-      "runId": "<runId>",
-      "factKind": "<factKind>",
-      "observedAtUnixMs": n,
-      "chunkKey": "runs/<runId>/<nnnn>.json" | "runs/<runId>/attempted/<id>.json",
-      "factIndex": n | null
-    }
-  ],
-  "state": <State for the store, section 2.4>
-}
-```
-
-### 2.2 The fact envelope
-
-One schema, `FactSchema`, in `createLedgerStore.schema.ts`. Every step's fact uses it. A step adds only its `body` schema.
-
-```
-{
-  "schemaVersion": 1,
-  "factKind": "listed" | "seen" | "withdrawn" | "checked" | "read" | "attempted" | "parsed" | "scanned" | "joined" | "failed",
-  "subject": { "kind": "source" | "event" | "document", "id": "<id>" },
-  "runId": "20261027T061500Z-k3f9qa",
-  "observedAtUnixMs": 1793000000000,
-  "writer": { "step": "parse", "codeVersion": "0f670e6", "sdkVersion": "0.9.0" },
-  "basedOn": [{ "store": "read/v3", "runId": "20261026T061500Z-p2x1mm", "subject": { "kind": "document", "id": "<id>" } }],
-  "body": { ... }
-}
-```
-
-- `factKind` says what happened. The audit trail reads straight off it: `listed` is created or changed, `seen` is listed again with no change, `read`, `parsed` and `scanned` are added, `withdrawn` is marked gone.
-- `basedOn` names the facts and content this fact was made from. This is the chain of custody: the record of where each thing came from. From any meeting file you can walk back to the bytes and the listing that made it. A tool finds a named fact through the subject's history in that store's snapshot.
-- `observedAtUnixMs` is when the step saw the thing: the time the page loaded, the file arrived or the parse ended. The audit trail needs a time, so a fact carries one. No step uses it to decide work. Work is decided by presence and by hash.
-- No field is optional. A field with no value is `null`.
-
-**Fact order.** The fold sorts facts by `observedAtUnixMs`, then run id, then place in the chunk. Run id alone is wrong: a deep run that started at 06:00 can load a page at 08:30, while a feed run that started at 08:00 loaded the same page at 08:10. The page at 08:30 is the truth. A reducer keeps, for each field that the newest fact decides, the observation time of the fact that set it, so a fact folded late never replaces a newer one.
-
-The run id is made once per process by `createRunContext`, and every store gets it from there.
-
-### 2.3 Fact bodies
-
-The subject of a fact is always the thing its fold produces. In the list store a document is part of its event, so a fact about a document names the event as its subject and the document in its body.
-
-**List, subject `event`**
-
-`listed`, when the event is new or this body differs from the newest `listed` fact:
-
-```
-{
+  "id": "<eventId>",
   "sourceId": "<id>",
   "title": "<text>",
-  "date": "<date text as today>",
+  "date": "<date text>",
   "url": "<url>",
-  "documents": [ { "id": "<id>", "title": "<text>", "url": "<url>" } ],
-  "scope": "feed" | "deep" | "first",
-  "pageResults": [ { "url": "<url>", "outcome": "ok" | "failed" } ]
+  "history": [ <HistoryEntry> ]
 }
 ```
 
-`seen`, when the event was listed again and nothing changed:
+### 2.2 Link
 
-```
-{ "scope": "feed" | "deep" | "first" }
-```
+`list/v3/events/data/<eventId>/documents/<documentId>.json`
 
-`withdrawn`, for one document, or for the whole event when `documentId` is `null`:
+One per document of the meeting. Written when the document is first found, with a `created` entry. Rewritten with one entry added each time: `updated` when `title`, `url` or `nextDocumentId` change, `archived` when the page loaded fine and no longer links it, `unarchived` when it is back after that. The links of a meeting form a chain from the document the event's last `first-document` entry names. An archived link keeps its `nextDocumentId`, so the chain runs through it, and a reader leaves it out. Archiving the first document, or one in the middle, rewrites nothing.
 
 ```
 {
-  "documentId": "<id>" | null,
-  "reason": "unlinked" | "by-hand",
-  "pageUrl": "<url>" | null
+  "id": "<documentId>",
+  "title": "<text>",
+  "url": "<url>",
+  "nextDocumentId": "<id>" | null,
+  "history": [ <HistoryEntry> ]
 }
 ```
 
-**List, subject `source`**
+A meeting page and two papers:
 
-`listed`, one per source per run. The failures of the run live here. The list store writes no `failed` facts.
+```
+events/data/<eventId>.json                            history ends: first-document <meetingPageId>
+events/data/<eventId>/documents/<meetingPageId>.json  nextDocumentId: <paper1Id>
+events/data/<eventId>/documents/<paper1Id>.json       nextDocumentId: <paper2Id>
+events/data/<eventId>/documents/<paper2Id>.json       nextDocumentId: null
+```
+
+### 2.3 Read record
+
+`read/v3/documents/data/<documentId>.json`, with the bytes at `read/v3/documents/bytes/<documentId>/<contentHash>`.
+
+Written on the first fetch. Rewritten on every fetch or check after that. The bytes are written once per hash. On a 304 the content fields stay, `outcome` is `same`, and `lastCheckedRunId` is this run.
 
 ```
 {
-  "scope": "feed" | "deep" | "first",
-  "pagesOpened": n,
-  "eventsSeen": n,
-  "failures": [
-    { "url": "<url>", "requestKind": "feed" | "service" | "document", "failure": <FailureEntry as today> }
-  ]
-}
-```
-
-**Read, subject `document`**
-
-`read`:
-
-```
-{
+  "id": "<documentId>",
+  "runId": "<runId>",
   "contentHash": "<hash>",
+  "contentHashes": [ { "contentHash": "<hash>", "runId": "<runId>" } ],
   "contentType": "<type>",
   "byteCount": n,
   "etag": "<text>" | null,
   "lastModified": "<text>" | null,
-  "hasValidator": true | false,
   "outcome": "new" | "same" | "changed",
-  "blobKey": "read/v3/blobs/<contentHash>"
+  "lastCheckedRunId": "<runId>"
 }
 ```
 
-`checked`, after a 304:
+### 2.4 Parse record
 
-```
-{ "etag": "<text>" | null, "lastModified": "<text>" | null }
-```
+`parse/v4/documents/data/<documentId>.json`, with the text at `parse/v4/documents/text/<documentId>/<contentHash>/<sdkVersion>.md` and the images at `parse/v4/documents/images/<documentId>/<contentHash>/<file>`.
 
-**Parse, subject `document`**
-
-`parsed`:
+Written on the first parse. Rewritten on a re-parse, for a new hash or a new SDK. The old text stays under its own key. `leftOut` and `images` keep today's shape.
 
 ```
 {
+  "id": "<documentId>",
+  "runId": "<runId>",
   "contentHash": "<hash>",
   "sdkVersion": "<version>",
-  "textKey": "parse/v4/text/<contentHash>/<sdkVersion>.md",
+  "textKey": "documents/text/<documentId>/<contentHash>/<sdkVersion>.md",
   "pageCount": n,
   "scanPages": [ n ],
-  "leftOut": <as in the parse record today>,
-  "images": [ "<file name>" ]
+  "leftOut": [ <as today> ],
+  "images": [ <as today> ]
 }
 ```
 
-**OCR, subject `document`**
+### 2.5 OCR record
 
-`scanned`:
+`ocr/v4/data/<documentId>.json`, with the text at `ocr/v4/text/<documentId>/<contentHash>/<sdkVersion>/<engineVersion>/<pagesReadCount>.md`.
+
+Written on the first scan. Rewritten on a re-scan, for a new hash, SDK, engine or page cap. The old text stays. The page lists keep today's shape.
 
 ```
 {
+  "id": "<documentId>",
+  "runId": "<runId>",
   "contentHash": "<hash>",
   "sdkVersion": "<version>",
   "engineVersion": "<version>",
-  "pagesRead": n,
-  "pagesLeft": n,
-  "pagesFailed": n,
-  "textKey": "ocr/v4/text/<contentHash>/<sdkVersion>/<engineVersion>/<pagesRead>.md"
+  "pagesRead": [ n ],
+  "pagesFailed": [ n ],
+  "pagesLeft": [ n ],
+  "leftOut": [ <as today> ],
+  "textKey": "text/<documentId>/<contentHash>/<sdkVersion>/<engineVersion>/<pagesReadCount>.md"
 }
 ```
 
-**Join, subject `event`**
+### 2.6 Join record
 
-`joined`:
+`join/v2/events/data/<eventId>.json`, with the file at `join/v2/events/files/<eventId>/<inputsHash>.md`.
+
+Written on the first build. Rewritten on each rebuild. The old file stays, so a judgment that cites it still points at what it judged. `textKeys` are the parse and OCR texts the file was built from, sorted. `inputsHash` is the hash of them plus the listing and the config, section 4.5.
 
 ```
 {
+  "id": "<eventId>",
+  "runId": "<runId>",
   "inputsHash": "<hash>",
-  "fileKey": "join/v2/events/<eventId>/<inputsHash>.md",
-  "parts": [ { "documentId": "<id>", "place": "<PartPlace from the SDK>" } ]
+  "fileKey": "events/files/<eventId>/<inputsHash>.md",
+  "textKeys": [ "<key>" ]
 }
 ```
 
-**Shared by more than one step**
+### 2.7 Error
 
-`attempted`, parse and OCR, written before the work. `engineVersion` is `null` in parse.
+`<store>/.../errors/<id>.json`, the same `errors/` keys as today.
 
-```
-{ "contentHash": "<hash>", "sdkVersion": "<version>", "engineVersion": "<version>" | null }
-```
-
-`failed`, read, parse, OCR and join. `class` is a row of the retry table in section 6. `status` is the HTTP status when there was one. `contentHash` is `null` in join.
-
-```
-{
-  "class": "<class>",
-  "reason": "<text>",
-  "status": n | null,
-  "contentHash": "<hash>" | null
-}
-```
-
-### 2.4 Folded states
-
-The `state` of a folded thing, per store. A list is in observation order, newest last. A field that the newest fact decides sits next to the observation time of the fact that set it, so a fact folded late never replaces a newer one.
-
-**List, `source`**
-
-```
-{
-  "lastRunId": "<runId>",
-  "lastScope": "feed" | "deep" | "first",
-  "lastPagesOpened": n,
-  "lastEventsSeen": n,
-  "lastFailures": [ <failure as in the source body> ]
-}
-```
-
-**List, `event`**
-
-```
-{
-  "sourceId": "<id>",
-  "title": "<text>",
-  "date": "<date text>",
-  "url": "<url>",
-  "detailObservedAtUnixMs": n,
-  "firstSeenRunId": "<runId>",
-  "lastSeenRunId": "<runId>",
-  "lastScope": "feed" | "deep" | "first",
-  "withdrawn": null | <Withdrawn>,
-  "documents": [
-    {
-      "id": "<id>",
-      "title": "<text>",
-      "url": "<url>",
-      "firstSeenRunId": "<runId>",
-      "lastSeenRunId": "<runId>",
-      "withdrawn": null | <Withdrawn>
-    }
-  ]
-}
-```
-
-`<Withdrawn>`:
-
-```
-{ "runId": "<runId>", "observedAtUnixMs": n, "reason": "unlinked" | "by-hand", "pageUrl": "<url>" | null }
-```
-
-**Attempts**, the output of `foldAttempts`. It sits in the states below as `attempts`.
-
-```
-{
-  "sinceGoodCount": n,
-  "lastClass": "<class>" | null,
-  "lastAtUnixMs": n | null,
-  "dueAfterUnixMs": n | null,
-  "parkedClass": "<class>" | null,
-  "lane": "heavy" | null
-}
-```
-
-**Read, `document`**
-
-```
-{
-  "currentContentHash": "<hash>" | null,
-  "contentHashes": [
-    { "contentHash": "<hash>", "contentType": "<type>", "byteCount": n, "firstSeenRunId": "<runId>" }
-  ],
-  "hasValidator": true | false | null,
-  "etag": "<text>" | null,
-  "lastModified": "<text>" | null,
-  "lastReadAtUnixMs": n | null,
-  "lastCheckedAtUnixMs": n | null,
-  "attempts": <Attempts>
-}
-```
-
-**Parse, `document`**
-
-```
-{
-  "parsed": [
-    { "contentHash": "<hash>", "sdkVersion": "<version>", "textKey": "<key>", "pageCount": n, "scanPages": [ n ], "images": [ "<file name>" ], "runId": "<runId>" }
-  ],
-  "attempts": <Attempts>
-}
-```
-
-**OCR, `document`**
-
-```
-{
-  "scanned": [
-    { "contentHash": "<hash>", "sdkVersion": "<version>", "engineVersion": "<version>", "pagesRead": n, "pagesLeft": n, "pagesFailed": n, "textKey": "<key>", "runId": "<runId>" }
-  ],
-  "attempts": <Attempts>
-}
-```
-
-**Join, `event`**
-
-```
-{
-  "joined": [ { "inputsHash": "<hash>", "fileKey": "<key>", "runId": "<runId>" } ],
-  "attempts": <Attempts>
-}
-```
-
-### 2.5 Catalog files
-
-`<CatalogEvent>`, one event as a reader outside the chain sees it:
+Rewritten on each failure, with `attempt` one higher. `attempt` starts at 1 again after a good object. `class` is a row of the retry rule in section 6. `url` is the page or file that failed, or `null` when the failure was not a request. `request` keeps today's `FailureEntry` for a request failure, and is `null` for a parse, scan or build failure. Parse and OCR write this object first, with class `cut-off`, and the data object after the work. The data object wins a tie on `runId`, so a crash in between leaves the error standing.
 
 ```
 {
   "id": "<id>",
+  "runId": "<runId>",
+  "class": "<class>",
+  "reason": "<text>",
+  "url": "<url>" | null,
+  "attempt": n,
+  "request": <FailureEntry as today> | null
+}
+```
+
+### 2.8 Snapshot
+
+`<store>/snapshot/<runId>.json`
+
+One per store. Written at the end of a run that changed something. It holds every data and error object of the store, by key, with the ETag the listing gave for that key. Content is not in it. A link or an event is current when the last of its `created`, `archived` and `unarchived` entries is not `archived`. An archived link still takes part in the chain through its `nextDocumentId`. A thing is in a failed state when its error's `runId` is newer than its data object's, or it has no data object.
+
+```
+{
+  "store": "<step>/v<n>",
+  "runId": "<runId>",
+  "objects": {
+    "<key>": { "etag": "<etag>", "object": <the object at that key> }
+  }
+}
+```
+
+### 2.9 Today's objects, for comparison
+
+`list/v2/events/data/<eventId>.json`, written over on every run:
+
+```
+{
+  "id": "<eventId>",
   "sourceId": "<id>",
   "title": "<text>",
   "date": "<date text>",
   "url": "<url>",
-  "withdrawn": true | false,
-  "fileKey": "join/v2/events/<eventId>/<inputsHash>.md" | null,
-  "documents": [
-    {
-      "id": "<id>",
-      "title": "<text>",
-      "url": "<url>",
-      "withdrawn": true | false,
-      "contentHash": "<hash>" | null,
-      "textKey": "<parse text key>" | null,
-      "ocrTextKey": "<OCR text key>" | null,
-      "parkedClass": "<class>" | null
-    }
-  ]
+  "documents": [ { "id": "<id>", "title": "<text>", "url": "<url>" } ]
 }
 ```
 
-`by-source/<sourceId>.json` and `by-date/<yyyy-mm>.json`. One of `sourceId` and `month` is set.
+`read/v2/documents/data/<documentId>`: the bytes only, with the content type on the object. No record.
+
+`parse/v3/documents/data/<documentId>.json`, with a started marker `{ "id" }` beside it:
 
 ```
 {
-  "schemaVersion": 1,
-  "runId": "<runId>",
-  "sourceId": "<id>" | null,
-  "month": "<yyyy-mm>" | null,
-  "events": [ <CatalogEvent> ]
+  "id": "<documentId>",
+  "sdkVersion": "<version>",
+  "pageCount": n,
+  "scanPages": [ n ],
+  "leftOut": [ { "languageName": "<text>", "unitCount": n } ],
+  "images": [ { "fileName": "<text>", "pageNumber": n, "kind": "page" | "picture", "width": n, "height": n, "byteCount": n } ]
 }
 ```
 
-`changes/<runId>.json`:
+`ocr/v3/data/<documentId>.json`:
 
 ```
 {
-  "schemaVersion": 1,
-  "runId": "<runId>",
-  "sinceRunId": "<runId>" | null,
-  "events": { "new": [ "<id>" ], "changed": [ "<id>" ], "withdrawn": [ "<id>" ] },
-  "documents": { "new": [ "<id>" ], "newText": [ "<id>" ], "newOcrText": [ "<id>" ], "withdrawn": [ "<id>" ] },
-  "files": [ { "eventId": "<id>", "fileKey": "<key>" } ]
+  "id": "<documentId>",
+  "pagesRead": [ n ],
+  "pagesFailed": [ n ],
+  "pagesLeft": [ n ],
+  "leftOut": [ <as today> ]
 }
 ```
 
-The catalog's `snapshot/HEAD.json`. It names every file, so a reader never lists the bucket.
+`join/v1/events/data/<eventId>.md`: the file only. No record.
 
-```
-{
-  "schemaVersion": 1,
-  "runId": "<runId>",
-  "sourceIds": [ "<id>" ],
-  "months": [ "<yyyy-mm>" ],
-  "changesRunIds": [ "<runId>" ]
-}
-```
+Errors, three shapes: list and read `{ "id", "failure": <FailureEntry> }`, parse and OCR `{ "id", "failure": { "failureClass", "reason" } }`, join `{ "id", "reason" }`. A `FailureEntry` has `url`, `hostKey`, `requestKind`, `failureClass`, `status`, `failedBy`, `browserResult`, `kind` and `reason`.
 
 ## 3. Why this shape and not the obvious ones
 
 | Obvious idea | Problem in an S3-style bucket | What this design does instead |
 | --- | --- | --- |
-| Audit fields as object metadata | A listing does not return custom metadata. To read it you need one HEAD request per object. When an object is written over, its old metadata is gone. | The audit fields live inside the fact. The folded thing carries its history. |
-| A soft-delete date written onto the object | Writing a field onto an object writes the whole object again. That is an overwrite, and the old state is lost. | A tombstone fact. The old facts stay. The fold hides the thing from that time on. A later listing can bring it back, and that is a fact too. |
-| Append to an existing object | S3 has no append. Each append is a full rewrite, and two writers can clash. | A new chunk per few hundred facts. Two writers cannot clash, because the run id is in the key. |
-| Check if a thing changed by comparing times | Times depend on when a run happened, and the join race in gap B5 shows times can lie. | Compare hashes. A thing is due when the hash of its inputs is not the hash its last output was built from. |
-| One object per fact, so a folder listing shows a thing's history | One PUT per fact. A list run writes one per event it sees, about 7,000 in development, the same count as today. The fold never reads them. | The chunk is the ledger. The folded thing carries its history. One GET answers the audit question, and a run writes tens of chunks, not thousands of objects. |
-| 256 shards from the first day | A run that touches a few shards needs a manifest for the rest, and a run start reads up to 512 files. | One file per store, about 40 MB at today's size. The head maps each shard to the run that last wrote it from the first day, so sharding later is a config change. |
+| Audit fields as object metadata | A listing does not return custom metadata. To read it you need one HEAD request per object. When an object is written over, its old metadata is gone. | The fields live in the object, and the object carries its history. |
+| A soft-delete date written onto the object | Writing a field onto an object writes the whole object again, and the old state is lost. | The same write, but the object keeps its history, so the old state is in it. A document is archived by an entry on its link. |
+| Bucket versioning as the audit trail | The rule lives in a bucket setting, which code cannot see and tests cannot check. | The history is a field. Code writes it and a test checks it. |
+| One record per event with the documents inside | Adding one document writes the whole record again. A failed page can shrink it. | One link per document. Adding a paper adds one object. A failed page writes nothing. |
+| The run id in every key, so nothing is ever written over | The bucket shows runs or versions, not meetings. The listing grows with every version. | Fixed keys, as today. Nothing is lost, because the history is inside. The listing grows only with things. |
+| Check if a thing changed by comparing times | Times depend on when a run happened, and the join race in gap B5 shows times can lie. | Compare hashes. Content keys hold the hash. The snapshot compares ETags, which are hashes of the objects. |
 
 ## 4. Each step
 
 ### 4.1 List
 
-**Facts it writes**
+**What it writes.** For each meeting the lister saw: the event object when the meeting is new, and again only when its title, date or url changed, its first document changed, or it was gone and is back, with the matching history entry. A link for each document that is new, changed, gone, or back, with a `created`, `updated`, `archived` or `unarchived` entry added. A document is gone only on positive evidence: the page loaded fine and no longer links it. A page that failed writes nothing for its event and documents, and writes the error object at `events/errors/<pageId>.json`, as today. This closes gap 2, the COINS shrink.
 
-- `listed`, subject `event`. Body: `sourceId`, `title`, `date`, `url`, `documents` as today, plus `scope` and `pageResults`: for each page the lister opened for this event, its address and `ok` or `failed`. Written when the event is new, or when this body differs from the newest `listed` fact in the fold.
-- `seen`, subject `event`. Body: `scope`. Written when the event was listed again and nothing changed. It is about a hundred bytes.
-- `listed`, subject `source`. Body: `scope`, `pagesOpened`, `eventsSeen`, `failures`. One per source per run. A source's facts are in a chunk as soon as it is listed, so a crash loses only what is in the open chunk, not the whole listing.
-- `withdrawn`, subject `event`, with the document id in the body, or `null` for the whole event. Written only on positive evidence: the page that listed the thing loaded fine and no longer links it. A failed page never makes a tombstone. A person can add one with a tool, with `reason: by-hand`.
-- No `failed` facts. A page that failed is in the `failures` list of the source's `listed` fact, with the failure entry as today.
+**Event identity.** For own-site sources that split meetings by date, the event id becomes the hash of `sourceId`, meeting date and committee title, not the first document address. The own-site lister already has the committee title from the page. This closes gap 12. The old event and its links stay.
 
-**The fold** for an event:
-
-- `documents` is the union of every document ever listed for the event. Each carries `firstSeenRunId`, `lastSeenRunId` and `withdrawn`: `null`, or the tombstone's run id and reason. A document that a later `listed` fact names again has `withdrawn: null` once more.
-- `title`, `date` and `url` come from the `listed` fact with the newest observation time.
-- A `listed` fact with a failed page adds what it saw and removes nothing. This closes gap 2, the COINS shrink.
-- `history` holds every fact's run id, kind and chunk key.
-
-**Event identity.** For own-site sources that split meetings by date, the event id becomes the hash of `sourceId`, meeting date and committee title, not the first document address. The own-site lister already has the committee title from the page. This closes gap 12. The fold still works if a source changes its rule, because the old event's facts stay.
-
-**Casting the net wide.** The lister takes a `scope` from config per run: `feed` (the feed window, cheap, often), `deep` (every index page the caps reach, by meeting date up to `councils.firstListingInDays`, less often) and `first` (the first time a source is seen). The scope is a field on the fact. The fold does not care which scope saw a document. A wide run can never harm a narrow one, and a narrow run can never shrink a wide one. The schedule outside the code decides when each scope runs. Nothing in the code names a cadence.
+**Casting the net wide.** The lister takes a `scope` per run: `feed` (the feed window, cheap, often), `deep` (every index page the caps reach, by meeting date up to `councils.firstListingInDays`, less often) and `first` (the first time a source is seen). The scope is not stored: nothing reads it, and which scope a run used is in the run log. A wide run can never harm a narrow one, and a narrow run can never shrink a wide one. The schedule outside the code decides when each scope runs. Nothing in the code names a cadence.
 
 ### 4.2 Read
 
-**What is due**: a document in the list snapshot that is not withdrawn, where one holds:
+**What is due**: a current document in the list snapshot where one holds:
 
-- it has no `read` fact, or
-- its newest `read` or `checked` fact is older than `read.recheckInDays`, its event is in the feed window, and its `read` fact says it has a validator, or
-- its newest fact is `failed` and the retry policy (section 6) says it is due.
+- it has no read record, or
+- its `lastCheckedRunId` is older than `read.recheckInDays`, its event is in the feed window, and it has an `etag` or a `lastModified`, or
+- it is in a failed state and the retry rule says its time has come.
 
-**Facts it writes**
+**What it writes.** The bytes to `documents/bytes/<documentId>/<contentHash>`, once per hash, and the read record. A conditional request that gets 304 rewrites the record with `outcome: same` and this run in `lastCheckedRunId`, with no download. This closes gap 1 at low cost. A failed fetch writes the error object with the document's address in `url`.
 
-- `read`, body: `contentHash`, `contentType`, `byteCount`, `etag`, `lastModified`, `hasValidator`, `outcome: new | same | changed`. The bytes go to `read/v3/blobs/<contentHash>`. The step always writes the blob: the same bytes go to the same key, so a second write changes nothing. Measure duplicate writes before building an index to skip them.
-- `checked`, body: `etag`, `lastModified`. Written when a conditional request returned 304. One header exchange, no download, and an audit entry that says "we looked on this day and it was the same". This closes gap 1 at low cost.
-- `failed`, as today.
-
-**The recheck needs two things that do not exist yet.** The HTTP client must send `If-None-Match` and `If-Modified-Since` and return a 304 as a result, not a failure. The browser fallback fetches through a real browser, so it does no recheck. A document with no validator is not rechecked. The `read` fact records `hasValidator`, and a metric counts documents without one, so the size of that hole is known.
-
-**The fold** for a document gives `currentContentHash`, `contentHashes` (every hash ever seen, with the run id that first saw it), `hasValidator` and `attempts`, which holds `dueAfterUnixMs`. The shape is in section 2.4.
+**The recheck needs two things that do not exist yet.** The HTTP client must send `If-None-Match` and `If-Modified-Since` and return a 304 as a result, not a failure. The browser fallback fetches through a real browser, so it does no recheck. A document with no validator is not rechecked, and a metric counts those, so the size of that hole is known.
 
 ### 4.3 Parse
 
-**What is due**: a document whose `currentContentHash` has no `parsed` fact with the current `sdkVersion`, and is not parked (section 6).
+**What is due**: a document whose read record's `contentHash` is not the hash in its parse record, or whose parse record has another `sdkVersion`, and that is not parked.
 
-**Facts it writes**
+**What it writes.** The error object with class `cut-off` first. Then the text at `documents/text/<documentId>/<contentHash>/<sdkVersion>.md`, the images at `documents/images/<documentId>/<contentHash>/<file>`, and the parse record. On a text failure, the error object again with the text failure class.
 
-- `attempted`, before the read. It is the one fact that is not put in a chunk. It is written at once as its own object, `runs/<runId>/attempted/<documentId>.json`, because it must survive the crash it guards against. It replaces the started marker, and it is never removed.
-- `parsed`, body: `contentHash`, `sdkVersion`, `textKey`, `pageCount`, `scanPages`, `leftOut`, `images`. Text at `parse/v4/text/<contentHash>/<sdkVersion>.md`. Images at `parse/v4/images/<contentHash>/<file>`.
-- `failed`, with the text failure class.
+An SDK upgrade makes every document due again by itself. `parse.redoShare` caps how many redo items a run takes, oldest meeting last, so the cloud job is not flooded. Gap 5 closes.
 
-An SDK upgrade makes every document due again by itself. The config decides how fast: `parse.redoShare` caps how many redo items a run takes, oldest meeting last, so the cloud job is not flooded. Gap 5 closes.
-
-**Shares.** The share is a filter over the due list after the fold, with the rule the step has today: the remainder of the id as a number, divided by the share count, is the share index. Every task reads the whole snapshot. At today's size that is tens of megabytes, which is small next to the work.
+**Shares.** The share is a filter over the due list, with the rule the step has today: the remainder of the id as a number, divided by the share count, is the share index. Every task reads the whole snapshot. A share run writes objects and no snapshot.
 
 ### 4.4 OCR
 
-**What is due**: a document whose current `parsed` fact has scan pages, and has no `scanned` fact for the same `contentHash`, `sdkVersion` and `engineVersion`, or whose newest such fact has `pagesLeft` over zero and `pagesRead` under `ocr.maxImagePages`. And it is not parked. So raising the cap makes the pages left due, and lowering it does nothing.
+**What is due**: a document whose parse record has scan pages, and whose OCR record is missing, or names another `contentHash`, `sdkVersion` or `engineVersion`, or has pages left and fewer pages read than `ocr.maxImagePages`. And it is not parked. So raising the cap makes the pages left due, and lowering it does nothing.
 
-The step finds its work from the parse snapshot, never by listing the images folder. Gap 7's double image listing goes. A missing parse record cannot happen, because the parse fact and its images are written before the snapshot names them. If an image is missing, the step writes a `failed` fact with `bytes-missing`, so gap 10 closes.
+The step finds its work from the parse snapshot, never by listing the images. Gap 7's double image listing goes. If an image is missing, the step writes a `bytes-missing` error, so gap 10 closes.
 
-**Facts it writes**
-
-- `attempted`, written at once like the parse step's. A scan that kills the task is counted, and parked after `attemptLimit` tries.
-- `scanned`, body: `contentHash`, `sdkVersion`, `engineVersion`, `pagesRead`, `pagesLeft`, `pagesFailed`, `textKey`. Text at `ocr/v4/text/<contentHash>/<sdkVersion>/<engineVersion>/<pagesRead>.md`, so a read with a higher cap is a new object and the old text stays.
-- `failed`, with the class.
+**What it writes.** The `cut-off` error first, then the text at `text/<documentId>/<contentHash>/<sdkVersion>/<engineVersion>/<pagesReadCount>.md` and the OCR record.
 
 **Shares.** A filter over the due list, like parse. The rule is free to change: the split by page count in `pipeline-ocr-efficiency.md` fits, because every task sees the same snapshot.
 
 ### 4.5 Join
 
-The join is its own step, after OCR, with its own store `join/v2`. This closes gap 11. Its store is read by `catalog` and later by `judge`.
+The join is its own step, after OCR, with its own store `join/v2`. This closes gap 11. Its snapshot is what the viewer and the judge read.
 
-**What is due**: an event whose `inputsHash` is not the `inputsHash` of its newest `joined` fact. `inputsHash` is the hash of the sorted list of keys the file would be built from: the event's folded listing with each document's `withdrawn` state, each document's current parse text key, each OCR text key, the config values `coverShare` and `wordsPerRun`, and the SDK version. No times. No race. A change to any input, the listing included, makes the event due. Gap 5's missed changes close.
+**What is due**: an event whose `inputsHash` is not the `inputsHash` of its join record. `inputsHash` is the hash of the sorted list of keys the file would be built from: the event's current documents in chain order, each document's parse text key, each OCR text key, the config values `coverShare` and `wordsPerRun`, and the SDK version. No times. No race. A change to any input, the listing included, makes the event due. Gap 5's missed changes close.
 
-Writes `join/v2/events/<eventId>/<inputsHash>.md` and a `joined` fact with `inputsHash` and `basedOn`. The old file stays, so a judgment that cites it still points at what it judged.
+**Document order.** The join starts at the document the event's last `first-document` entry names and follows `nextDocumentId` through every link, archived ones included, until `null` or an id it has already seen. Archived links are left out of the file. A current document the chain did not reach goes at the end, by title. No pointer mistake loses a document.
 
-A failed build writes a `failed` fact, and the retry policy limits it.
+**What it writes.** The file at `events/files/<eventId>/<inputsHash>.md` and the join record. A failed build writes the error object.
 
-### 4.6 Catalog
+**Readers outside the chain.** The document viewer reads the list, parse, OCR and join snapshots. Its folder constants in `labelStore.mjs` become the four snapshot prefixes.
 
-A new step, after join and before judge. It reads every snapshot and writes one store, `catalog/v1`, for readers outside the chain: the document viewer, the judge, retrospective tools and Grafana. It is the one place a reader goes.
+## 5. Snapshots and the ETag listing: the fast path
 
-- `catalog/v1/snapshot/<runId>/by-source/<sourceId>.json`: the events of one council, with their documents and the keys of their current text and meeting file.
-- `catalog/v1/snapshot/<runId>/by-date/<yyyy-mm>.json`: the same, by meeting month.
-- `catalog/v1/changes/<runId>.json`: what changed since the last catalog run: new events, new documents, new text, new meeting files, tombstones. A reader that wants to stay current reads only this.
-- `catalog/v1/snapshot/HEAD.json`.
-
-The viewer's folder constants in `labelStore.mjs` become one: the catalog head.
-
-## 5. Snapshots: the fast path
-
-Today a run with nothing new downloads every event record four times and lists every image twice. That is the cost that grows each day (gap 7). The snapshot removes it.
+Today a run with nothing new downloads every event record four times and lists every image twice. That is the cost that grows each day (gap 7). The snapshot and one listing replace it.
 
 **How a step starts a run**
 
-1. Read `HEAD.json` of its own store and of the step before. Two small reads.
-2. Read the snapshot files both heads name. One file per store to start.
-3. List the `runs/` prefix of both stores with the delimiter. One call returns every run folder and every done marker. A run is settled when it has a done marker, or when its start time is more than `snapshot.longestRunInHours` ago. For each settled run that `foldedRuns` does not name, or names with fewer chunks or `attempted` objects than its done marker counts: list its folder, read the chunks not yet folded and its `attempted` objects, and fold them in. A run that is not settled is still running. Leave it for the next run. The step does this for both stores, and saves the result only for its own. The other store's head is its owner's to write.
-4. Work out what is due. Do the work. Append facts. Write a chunk every `snapshot.chunkSize` facts, and when `snapshot.chunkWaitInSeconds` passes with facts waiting. Write the done marker last.
-5. Fold this run's facts. Save the snapshot under the run id. Write `HEAD.json`: `foldedRuns` is the old map, plus the runs folded in step 3, plus this run.
+1. List `snapshot/` of its own store and of the step before. The last key in each listing is the newest snapshot. Read both.
+2. List the `data/` and `errors/` prefixes of both stores, sixteen prefixes at once, `bucket.listsAtOnce`. The listing gives each key with its ETag. A key that is not in the snapshot, or whose ETag differs, is new or changed: GET it. Everything else is already in hand.
+3. Work out what is due. Do the work. Write each object with this run's id.
+4. If this run wrote an object, or step 2 found one, save `snapshot/<runId>.json`. A run that changed nothing writes nothing. A share run skips this step: the single run after it does it.
 
-**Two runs at once.** Run A starts at 06:00 and run B at 06:05. Both read the head and find no unfolded run. A finishes first: done marker, snapshot, a head whose `foldedRuns` names A. B finishes: a head whose `foldedRuns` names B and not A. Run C reads the head, lists `runs/`, finds A's done marker, sees A is not in `foldedRuns`, and folds A. No fact is lost. The head is a cache. The listing of `runs/` is the truth.
+Step 2 is done for both stores, in memory. A step saves only its own snapshot.
 
-**Crash safety.** A chunk is complete on its own. A run that dies leaves chunks, `attempted` objects and no done marker. After `snapshot.longestRunInHours` the next run treats it as settled and folds what it left. The facts in the open chunk are lost. The loss is bounded by `snapshot.chunkSize`, and the work is done again next run, which is safe because every output key is by content hash. Nothing is parked by a crash. Gap 6 closes without a lock. Gap 9 closes because a source's facts are in a chunk as soon as it is listed.
+**Why the ETag and not the time.** The ETag is a hash of the object's bytes. A rewrite with the same bytes gives the same tag, so it costs no GET. A rewrite with new bytes gives a new tag, whenever it happened. A write that lands while a listing is in flight is caught by the next listing, because its tag still differs. No clock is read, and no run can be missed.
+
+**Crash safety.** An object is complete on its own. A run that dies leaves objects and no snapshot. The next run's listing finds their ETags new and picks them up. A parse or scan that died leaves its `cut-off` error standing, and the retry rule counts it. Gap 6 closes without a lock. Gap 9 closes because an object is in the bucket as soon as it is made, not at the end of the run.
+
+**The cost of the listing.** It is the one cost that grows, and it grows only with things, not with runs or versions.
+
+| Store | Keys under `data/` and `errors/` today | After one year | Listing time, sixteen prefixes at once |
+| --- | --- | --- | --- |
+| list | about 65,000: 7,000 events and 58,000 links | about 450,000 | a few seconds |
+| read | about 60,000 | about 400,000 | a few seconds |
+| parse | about 60,000 | about 400,000 | a few seconds |
+| OCR | about 10,000 | about 70,000 | under a second |
+| join | about 7,000 | about 50,000 | under a second |
+
+A listing page holds 1,000 keys and takes about a tenth of a second. The counts assume about 7,500 new documents a week, as the list step sees today.
 
 **Cost of a run with nothing new**
 
 | Today | After |
 | --- | --- |
-| About 4 reads of every event record ever saved, thousands of GETs, growing daily | 2 head reads, 2 snapshot reads, 2 listings of `runs/`, flat for ever |
+| About 4 reads of every event record ever saved, thousands of GETs, growing daily | 2 snapshot reads and 2 listings, no GETs |
 | 2 listings of the images folder, hundreds of thousands of keys | None |
-| Every listed event saved again, about 7,000 PUTs in development | A `seen` fact per event and a `listed` fact per source, in tens of chunk PUTs |
+| Every listed event saved again, about 7,000 PUTs in development | Nothing |
 
-**Size estimates**
+**Size estimates.** A link is about 300 bytes and an event about 400, so the list snapshot is about 20 MB at today's size. A document record is about 400 bytes, so the read and parse snapshots are about 25 MB each. These are estimates from the schemas, not measurements. At ten times today's size the list snapshot is about 200 MB. If one file is then too slow, split it by the first hex character of the id, as a new store version.
 
-| Measure | Estimate |
-| --- | --- |
-| Events in the development list store | about 7,000 |
-| One folded event, 20 documents with id, title and url | about 6 KB |
-| List snapshot | about 40 MB |
-| Document snapshot in read, parse or OCR, about 58,000 documents | about 25 MB |
-| One list run's chunks | a few MB |
+**Rebuild.** A tool lists every key under `data/` and `errors/`, GETs them all, and writes a snapshot. It is the proof that the snapshot is a cache.
 
-These are estimates from the schemas, not measurements. Section 11 says what to measure first.
+**Retention.** A rule may expire snapshots older than `snapshot.keepInDays`. That is the only deletion in the system, and it deletes only a cache. Objects and content are never deleted.
 
-**Sharding later.** The head records `shardCount`. While it is 1, the snapshot is `all.json`. When one file passes about 100 MB, raise the count: a shard is picked by the first hex characters of the id with `pickShard`, and the head's `shards` map, which already names the run that last wrote each shard, lets a run write only the shards it touched. A snapshot with a new count is a new snapshot, not a new store version. At ten times today's size the list snapshot is about 400 MB, so it needs about 16 shards by then.
+## 6. Failures and retries: the rule is code
 
-**Why only one mutable object.** `HEAD.json` is written over. It holds the run id, the shard map and the folded runs map. Every snapshot it ever pointed at is still there under its run id, so even the index has an audit trail. Turn on object versioning in the bucket as a second safety, so the head's old values are kept too. A retention rule may expire snapshots older than `snapshot.keepInDays`. That is the only deletion in the system, and it deletes only a cache. Chunks are never deleted.
+The rule lives in one function, `readNextTry`, in the domain code, and every step calls it. Config holds no retry table, so the rule cannot drift from the code that applies it.
 
-## 6. Failures and retries, one rule for every step
+The rule: a failure of a class is tried again after a wait that doubles each time, up to a number of tries for that class. The wait starts at the failed run's start time, which is in the error object's `runId`. Past the last try, the thing is parked. An `out-of-memory` failure is taken only by the heavy cloud job's share filter.
 
-One config table, used by read, parse, OCR and join through the same fold:
+| Class | Tries | First wait | Then |
+| --- | --- | --- | --- |
+| `gateway` | 8 | 1 hour | doubles |
+| `bytes-missing` | 3 | 1 hour | doubles |
+| `blocked` | 5 | 12 hours | doubles |
+| `gone` | 3 | 1 day | doubles |
+| `cut-off` | 2 | 1 day | the same |
+| `out-of-memory` | 2 | 1 day | the same |
+| `restricted` | 1 | none | parked |
 
-```
-retry:
-  gone:          { attemptLimit: 3, firstWaitInHours: 24, growth: 2 }
-  blocked:       { attemptLimit: 5, firstWaitInHours: 12, growth: 2 }
-  gateway:       { attemptLimit: 8, firstWaitInHours: 1,  growth: 2 }
-  cut-off:       { attemptLimit: 2, firstWaitInHours: 24, growth: 1 }
-  out-of-memory: { attemptLimit: 2, firstWaitInHours: 24, growth: 1, lane: heavy }
-  bytes-missing: { attemptLimit: 3, firstWaitInHours: 1,  growth: 2 }
-  restricted:    { attemptLimit: 1, firstWaitInHours: 0,  growth: 1 }
-```
-
-The fold counts `attempted` and `failed` facts since the last good fact, and sets `dueAfterUnixMs` from the last failure and the table. An `attempted` fact with no outcome after it counts as `cut-off`: that is the crash case. A thing past its limit is `parked`, with the class. Nothing is ever parked for ever by code: raise the limit in config and it is due again. `clear:parked` goes away. A `lane: heavy` class is picked up by the heavy cloud job's share filter. Gaps 3 and 4 close, and a metric counts parked things by class and step, so nothing is dropped out of sight.
+Nothing is parked for ever by code: a release that raises a number makes the parked things of that class due again. `clear:parked` goes away. A metric counts parked things by class and step. Gaps 3 and 4 close.
 
 ## 7. The audit trail: the questions it answers
 
 | Question | How |
 | --- | --- |
-| When did we first see document D, and in which run? | The list snapshot: `firstSeenRunId`. |
-| What happened to D, in order? | D's `history` in the read, parse and OCR snapshots. One read per store. Each entry names the chunk that holds the full fact. |
-| Did the council change the file? | The read fold: `contentHashes` has two entries with two run ids. |
-| Did we check D on a day and find it the same? | A `checked` fact in D's history. |
-| Why is D marked gone? | The `withdrawn` fact: run id, time, reason, and the page that no longer links it. |
-| What did meeting file M get built from? | The `joined` fact's `basedOn`. Follow each entry through its subject's history. |
-| What changed since Tuesday? | Read `catalog/v1/changes/` for the runs after Tuesday's run id. |
+| When did we first see document D in meeting M? | D's link: the `created` entry in its history. One GET. |
+| What happened to D, in order? | D's link history, then D's read record, whose `contentHashes` name every version of the file and the run that saw it, then the `runId` on its parse and OCR records. |
+| Did the council change the file? | D's read record: `contentHashes` has two entries. |
+| Did we check D lately and find it the same? | D's read record: `outcome: same` and `lastCheckedRunId`. Only the last check is kept. |
+| Why is D marked gone? | D's link: the last `archived` entry names the run. That run's log has the page that no longer linked it. |
+| What did meeting file M get built from? | The join record's `textKeys`. |
+| What changed since Tuesday? | Snapshots are kept. Compare Tuesday's with the newest: every key whose ETag differs changed. |
 | Was the old text used after an SDK upgrade? | Impossible by construction. The text key holds the SDK version. |
-| What did run R do? | List `runs/R/` and read its chunks. |
 
-## 8. DRY: what is built once
+Every answer is a GET in the bucket console, or a tool over two snapshots.
+
+## 8. Built once
 
 | Thing | Built once in | Used by |
 | --- | --- | --- |
-| Fact envelope schema and the run id | `createLedgerStore.schema.ts`, `createRunContext` | every step |
-| Chunk, done marker, head, snapshot, folded thing and attempts shapes | `createLedgerStore.schema.ts` | every step |
-| Append a fact, write chunks and the done marker, write `attempted` at once | `createLedgerStore` | every step |
-| Fold driver: read heads, read snapshots, list runs with the delimiter, fold settled runs, save the snapshot, write the head | `createLedgerStore` | every step, with its own reducer |
-| Delimiter listing | `ObjectBucket.readObjectFolders` | `createLedgerStore` |
-| Shard rule | `pickShard(id)` | snapshots |
+| The run id | `createRunContext` | every step |
+| Listing with ETags, sixteen prefixes at once | `ObjectBucket.readObjectEntries` | `createStoreSnapshot` |
+| Find the newest snapshots, read them, list and diff by ETag, GET the changes, save the snapshot | `createStoreSnapshot` | every step |
+| The `id` and `runId` fields, the error object and the snapshot shape | `createStoreSnapshot.schema.ts` | every step |
+| The retry rule | `readNextTry` | read, parse, OCR, join |
 | Share filter | `readIsOwnShare` | parse, OCR |
-| Retry fold and the config table | `foldAttempts` | read, parse, OCR, join |
 | Content keys by hash and version | `buildContentKey` | read, parse, OCR, join |
 | Inputs hash for a derived file | `hashInputs(keys)` | join; later judge |
-| Catalog views and change files | `buildCatalogStep` | viewer, judge, tools, Grafana |
+| Rebuild a snapshot, compare two snapshots | `tools/stores/` | people |
 
-Each step keeps three things of its own: its body schema, its reducer and its due rule. Everything else is shared.
+Each step keeps three things of its own: its object shapes, what it writes, and its due rule. Everything else is shared.
 
-**Tests.** The fold is a pure function, so each reducer is tested with a table of facts in and state out. Two property tests run for every store:
+**Tests.** Each due rule is tested with a table: a snapshot in, the due list out. Each store's write rule is tested with a table: the old object and what the run saw in, the new object out. One property test runs for every store: the snapshot after a run equals a GET of every key under `data/` and `errors/`.
 
-1. Folding every fact at once gives the same state as folding a snapshot and then the rest.
-2. Folding a snapshot of a run set S, and then the runs not in S, gives the same state, for an S that is not a prefix of the run order. This is the two-runs-at-once case.
-
-**New config values**
-
-| Value | What it sets |
-| --- | --- |
-| `snapshot.chunkSize` | Facts per chunk. Also the most a crash can lose. |
-| `snapshot.chunkWaitInSeconds` | Longest time facts wait in memory before a chunk is written. |
-| `snapshot.longestRunInHours` | A run older than this with no done marker is treated as crashed and folded. |
-| `snapshot.shardCount` | 1 to start. |
-| `snapshot.keepInDays` | The retention rule for old snapshots. |
-| `councils.firstListingInDays` | How far back a `deep` or `first` scope lists, by meeting date. |
-| `read.recheckInDays` | How old a `read` or `checked` fact must be before a document with a validator is checked again. |
-| `parse.redoShare` | The most of a run's items that may be redo work after an SDK upgrade. |
-| `retry.*` | The table in section 6. |
+**Config.** Five values, all knobs and no rules: `read.recheckInDays`, `parse.redoShare`, `councils.firstListingInDays`, `snapshot.keepInDays` and `bucket.listsAtOnce`. The scope of a list run comes in the same way `run.steps` does.
 
 ## 9. How the gaps close
 
 | # | Gap | Closed by |
 | --- | --- | --- |
-| 1 | Changed council file never seen | Content hash in the `read` fact, conditional recheck, `checked` facts. A new hash makes parse, OCR and join due. |
-| 2 | Partial COINS listing shrinks the event | The fold is a union. A failed page adds, never removes. |
-| 3 | Parse and OCR failures parked for ever | Retry table and attempt fold. |
-| 4 | Read failures tried every day, then dropped silently | Retry table, and a parked metric. |
+| 1 | Changed council file never seen | Content hash in the read record, and a conditional recheck. A new hash makes parse, OCR and join due. |
+| 2 | Partial COINS listing shrinks the event | One link per document. A failed page writes nothing. A removal needs positive evidence. |
+| 3 | Parse and OCR failures parked for ever | The retry rule and `attempt` on the error object. |
+| 4 | Read failures tried every day, then dropped silently | The retry rule, and a parked metric. |
 | 5 | Upgrades do not flow down | Versions in the content keys. Inputs hash on the join. |
-| 6 | No lock, crash parks work | Run id in every key. Chunks and done markers. `attempted` written at once, with a limit. |
-| 7 | Cost grows each day | Snapshots and chunks. No big listings. |
-| 8 | Coverage holes | Listing scopes, and a union fold that makes a deep run safe. |
-| 9 | List saves all or nothing | A source's facts are in a chunk as soon as it is listed. |
-| 10 | Images with no parse record | Work comes from the parse snapshot, and a `bytes-missing` fact. |
+| 6 | No lock, crash parks work | A `cut-off` error written first, counted by the retry rule, with a limit. |
+| 7 | Cost grows each day | Snapshots, and one ETag listing in place of GETs. |
+| 8 | Coverage holes | Listing scopes. A deep run can only add links and histories. |
+| 9 | List saves all or nothing | An object is in the bucket as soon as it is made. |
+| 10 | Images with no parse record | Work comes from the parse snapshot, and a `bytes-missing` error. |
 | 11 | Join before OCR | Join is its own step after OCR. |
 | 12 | Own-site meeting gets a new id | Event id from source, date and committee. |
 
@@ -704,20 +450,22 @@ Each step keeps three things of its own: its body schema, its reducer and its du
 
 Each item stands on its own and is a run's worth of checking.
 
-1. `ObjectBucket.readObjectFolders` with the delimiter. `createRunContext`. `createLedgerStore` with the envelope, chunks, the done marker, `attempted` at once, the one-file snapshot, the head with `foldedRuns`, and the fold driver. Both property tests. No step uses it yet.
+1. `ObjectBucket.readObjectEntries` with ETags over sixteen prefixes at once. `createRunContext`. `createStoreSnapshot` with the ETag diff, the `id` and `runId` fields, the error object, the snapshot, `readNextTry`, and the rebuild tool. The property test. No step uses it yet.
 2. Conditional requests in the HTTP client: send the validators, return 304 as a result.
-3. List on `list/v3` and read on `read/v3` together, so listings keep flowing: `listed`, `seen` and source facts, the union fold, scopes, the new own-site event id, tombstones only from positive evidence; blobs by hash, `read` and `checked` facts, the retry fold. A migration tool copies the old read store's bytes to blobs by hash and writes one `read` fact per document under run id `20261101T000000Z-migrate`. No content hash is stored today, and a bucket listing gives an ETag, not a SHA-256, so the tool must download every blob once. Run it as a Cloud Run job in the bucket's region, where reads from the bucket have no network charge. Old folders stay.
-4. Parse on `parse/v4` and OCR on `ocr/v4`: content keys with versions, `attempted` facts, work from snapshots. The same migration tool writes `parsed` and `scanned` facts for what exists, with the SDK version each record saved.
-5. Join as its own step on `join/v2`, with the inputs hash.
-6. Catalog, then point the viewer at it.
-7. Turn on bucket object versioning and the snapshot retention rule.
+3. List on `list/v3` and read on `read/v3` together, so listings keep flowing: events and links with history and the chain, scopes, the new own-site event id; bytes by hash and read records. A migration tool copies the old read store's bytes under each document by hash and writes one read record per document under run id `20261101T000000Z-migrate`. No content hash is stored today, and a bucket listing gives an ETag, not a SHA-256, so the tool must download every blob once. Run it as a Cloud Run job in the bucket's region, where reads from the bucket have no network charge. Old folders stay.
+4. Parse on `parse/v4` and OCR on `ocr/v4`: content under the document by hash and version, `cut-off` first, work from snapshots. The same migration tool writes parse and OCR records for what exists, with the SDK version each record saved.
+5. Join as its own step on `join/v2`, with the inputs hash and the file under `files/`.
+6. Point the viewer at the snapshots.
+7. The snapshot retention rule.
 
 ## 11. Not decided, and not confirmed
 
-1. The sizes in section 5 are estimates from the schemas: about 6 KB per folded event. Build step 1, fold the development list store once, and measure the file before choosing a chunk size or a shard count.
-2. Whether Bun's S3 client sends the delimiter to Google Cloud Storage's S3 interface and gets the run folders back. The option is in the types of Bun 1.4.2. One call against the development bucket confirms it.
+1. The sizes in section 5 are estimates from the schemas and from the list step's counts. Build step 1, build the development list snapshot once, and time one listing of `events/data/`.
+2. That Google Cloud Storage returns the ETag in an S3-style listing, and that Bun's client passes it through. The type in Bun 1.4.2 has the field. One call against the development bucket confirms it.
 3. How many councils send `ETag` or `Last-Modified` with a document. The read step can log the headers for one run. This sets how much of gap 1 the recheck really closes.
 4. Which own-site sources split by date, and so which events change id. The migration tool reports it.
-5. Whether the judge should read the catalog or the join store. The catalog is simpler. The one-writer test allows either.
-6. The size of the old read store in bytes, which sets the time of the migration job.
-7. Nothing here was run. The first safe test is step 1 with the property tests. Then step 3 on the development bucket, run twice: the second run writes only `seen`, source and `checked` facts.
+5. The size of the old read store in bytes, which sets the time of the migration job.
+6. Bytes and text under the document, not under a shared hash folder, means the same file at two addresses is stored and parsed twice. That is today's behaviour. It keeps everything about a document in one place. Measure how often it happens before deciding it matters.
+7. The retry numbers are constants in domain code. The house-style rule `value-lives-in-config` fails on a number the code chose, so they need adding to `allowedNumbers`, which is the owner's permission to give.
+8. Whether to guard the no-overlap rule in code. The schedule may be guard enough.
+9. Nothing here was run. The first safe test is step 1 with the property test and the rebuild tool. Then step 3 on the development bucket, run twice: the second run writes no object and no snapshot.
