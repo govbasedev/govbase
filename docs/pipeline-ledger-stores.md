@@ -15,6 +15,8 @@ Run the pipeline often. Never lose data. Add to it. Mark a thing as gone, but ne
 - **Object**: one JSON file about one thing, at a fixed key, as today. It is rewritten only when the thing changes, and the new version holds everything the old one held plus the change.
 - **Link**: the object that ties one document to one event. It sits beside the event, at `events/data/<eventId>/documents/<documentId>.json`.
 - **History**: a list on an event or a link of what happened to it and in which run: `created`, `updated`, `archived`, `unarchived`, and for an event which document comes first. Each entry has a `kind`, so a reader switches on it.
+- **Document id**: the SHA-256 of the document's address, as a hex string, as today. The input is the `url` string exactly as the lister hands it over, after the lister has made it absolute. `ItemIdSchema` in the list store is the only place that makes it, and every later store uses it as it is.
+- **Event id**: today the same hash over the meeting page's address, so the meeting page's link has the event's id. For own-site sources that split meetings by date, the hash of the source id, the meeting date and the committee title, section 4.1.
 - **Run id**: a name for one run of one step. It starts with the start time, so run ids sort in time order. Example: `20261027T061500Z-k3f9qa`.
 - **ETag**: a tag the bucket gives every object and returns in a listing. It changes when the object's bytes change, and only then. Comparing ETags finds changed objects with no GET and no clock.
 - **Snapshot**: one file per store that holds a copy of every object in it, with the object's ETag. It is a cache. It can always be built again from the objects.
@@ -28,7 +30,7 @@ Today's stores, with four changes.
 
 1. **Documents leave the event.** The event object holds the meeting's own facts and its history, which also names its first document. Each document of a meeting is its own small link object beside the event, with a pointer to the next document. Adding a paper adds one object and rewrites at most the link before it. The event is rewritten for a document only when the first document changes, which is rare.
 2. **Every object carries its history.** An object is rewritten only when its thing changes, and the new version holds everything the old one held plus the change. A removed document is not deleted: its link gets an `archived` entry. Nothing is ever lost.
-3. **Every object carries its `id`.** It is there so a migration can move an object and still know what it is about. The parse, OCR and join records and the error object also carry the `runId` that last wrote them, so the newer of a record and its error wins. An event, a link and a read record carry their runs in `history` instead.
+3. **Every object carries its `id`.** It is there so a migration can move an object and still know what it is about. The OCR and join records and the error object also carry the `runId` that last wrote them, so the newer of a record and its error wins. An event, a link, a read record and a parse record carry their runs in `history` instead.
 4. **One snapshot per store, refreshed by ETag.** A step lists the store, sixteen prefixes at once, compares each key's ETag with the one in its snapshot, and GETs only the keys that are new or changed. No step reads the bucket's modified times. No step GETs an object it already has.
 
 Carried over from the redesign:
@@ -59,17 +61,18 @@ parse/v4/
 
 ## 2. The shapes
 
-Eight shapes. Every object starts with `id`, the thing it is about. The parse, OCR and join records and the error object also carry `runId`, the run that last wrote them, so the newer of a record and its error can be told. An event, a link and a read record carry their runs in `history`. A type sits in angle brackets, a bar separates choices, and `n` is a number. Every field is present. A field with no value is `null`. No object carries a schema version: the folder version does, as today.
+Eight shapes. Every object starts with `id`, the thing it is about. The OCR and join records and the error object also carry `runId`, the run that last wrote them, so the newer of a record and its error can be told. An event, a link, a read record and a parse record carry their runs in `history`. A type sits in angle brackets, a bar separates choices, and `n` is a number. Every field is present. A field with no value is `null`. No object carries a schema version: the folder version does, as today.
 
 Each object below is shown in the same order: its key, the object today, the object after, what changed, and when it is written.
 
-The event, the link and the read record share one history entry. It is a union on `kind`. A meeting or a document is current when the last of its `created`, `archived` and `unarchived` entries is not `archived`. The chain of a meeting starts at the `documentId` of its last `first-document` entry. `fetched` and `checked` belong to the read record. `fetched` carries the hash the bytes had, so a change of the file is in the history. `checked` is only the run. The type, size and ETag live at the top of the read record, to keep the entries small.
+The event, the link, the read record and the parse record share one history entry. It is a union on `kind`. A meeting or a document is current when the last of its `created`, `archived` and `unarchived` entries is not `archived`. The chain of a meeting starts at the `documentId` of its last `first-document` entry. `fetched` and `checked` belong to the read record. `fetched` carries the hash the bytes had, so a change of the file is in the history. `checked` is only the run. The type, size and ETag live at the top of the read record, to keep the entries small. `parsed` names the bytes and the SDK a parse used, so every text that exists for a document is in its history.
 
 ```
 { "kind": "created" | "updated" | "archived" | "unarchived", "runId": "<runId>" }
 { "kind": "first-document", "runId": "<runId>", "documentId": "<documentId>" }
 { "kind": "fetched", "runId": "<runId>", "contentHash": "<hash>" }
 { "kind": "checked", "runId": "<runId>" }
+{ "kind": "parsed", "runId": "<runId>", "contentHash": "<hash>", "sdkVersion": "<version>" }
 ```
 
 ### 2.1 Event
@@ -190,20 +193,20 @@ After:
 ```
 {
   "id": "<documentId>",
-  "runId": "<runId>",
   "contentHash": "<hash>",
   "sdkVersion": "<version>",
   "textKey": "documents/text/<documentId>/<contentHash>/<sdkVersion>.md",
   "pageCount": n,
   "scanPages": [ n ],
   "leftOut": [ <as today> ],
-  "images": [ <as today> ]
+  "images": [ <as today> ],
+  "history": [ <HistoryEntry> ]
 }
 ```
 
-What changed: added `runId`, `contentHash` and `textKey`. `leftOut` and `images` keep today's shape. The text and images move under the content hash and SDK version, so a re-parse never writes over them. The started marker is gone: the error object is written first instead, 2.7.
+What changed: added `contentHash`, `textKey` and `history`. The top is the newest parse. Each `parsed` entry names the bytes and the SDK of one parse, so every text that exists for the document is in the history. `leftOut` and `images` keep today's shape. The text and images move under the content hash and SDK version, so a parse never writes over another. The started marker is gone: the error object is written first instead, 2.7.
 
-Written on the first parse. Rewritten on a re-parse, for a new hash or a new SDK.
+One `parsed` entry per parse.
 
 ### 2.5 OCR record
 
@@ -353,7 +356,7 @@ Written at the end of a run that changed something.
 
 ### 4.3 Parse
 
-**What is due**: a document whose read record's `contentHash` is not the hash in its parse record, or whose parse record has another `sdkVersion`, and that is not parked.
+**What is due**: a document with no `parsed` entry for its read record's `contentHash` and the current `sdkVersion`, and that is not parked. A file that goes back to bytes already parsed is not parsed again, because its text is still there.
 
 **What it writes.** The error object with class `cut-off` first. Then the text at `documents/text/<documentId>/<contentHash>/<sdkVersion>.md`, the images at `documents/images/<documentId>/<contentHash>/<file>`, and the parse record. On a text failure, the error object again with the text failure class.
 
@@ -449,7 +452,7 @@ Nothing is parked for ever by code: a release that raises a number makes the par
 | Question | How |
 | --- | --- |
 | When did we first see document D in meeting M? | D's link: the `created` entry in its history. One GET. |
-| What happened to D, in order? | D's link history, then D's read record history, which has every fetch and check with its run, then the `runId` on its parse and OCR records. |
+| What happened to D, in order? | D's link history, then D's read record history, which has every fetch and check with its run, then D's parse record history, which has every parse with its bytes and SDK, then the `runId` on its OCR record. |
 | Did the council change the file? | D's read record: two `fetched` entries with different hashes. |
 | Did we check D lately and find it the same? | D's read record: the last `checked` entry. Every check is kept. |
 | Why is D marked gone? | D's link: the last `archived` entry names the run. That run's log has the page that no longer linked it. |
