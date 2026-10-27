@@ -20,7 +20,7 @@ Run the pipeline often. Never lose data. Add to it. Mark a thing as gone, but ne
 - **Snapshot**: one file per store that holds a copy of every object in it, with the object's ETag. It is a cache. It can always be built again from the objects.
 - **Share run**: one task of a cloud job that does part of a step's work. It writes objects and no snapshot.
 - **Content hash**: the SHA-256 of a file's bytes. The same bytes always give the same hash.
-- **Validator**: a header a web server sends with a file, `ETag` or `Last-Modified`. A later request sends it back to ask "has it changed?".
+- **Validator**: the `ETag` a web server sends with a file. A later request sends it back to ask "has it changed?". `Last-Modified` is the weaker validator, and this design does not use it.
 
 ## 1. The design in one page
 
@@ -28,7 +28,7 @@ Today's stores, with four changes.
 
 1. **Documents leave the event.** The event object holds the meeting's own facts and its history, which also names its first document. Each document of a meeting is its own small link object beside the event, with a pointer to the next document. Adding a paper adds one object and rewrites at most the link before it. The event is rewritten for a document only when the first document changes, which is rare.
 2. **Every object carries its history.** An object is rewritten only when its thing changes, and the new version holds everything the old one held plus the change. A removed document is not deleted: its link gets an `archived` entry. Nothing is ever lost.
-3. **Every object carries its `id`.** It is there so a migration can move an object and still know what it is about. A record that has an error object beside it, and the error object, also carry the `runId` that last wrote them, so the newer of the two wins. An event and a link carry their runs in `history` instead.
+3. **Every object carries its `id`.** It is there so a migration can move an object and still know what it is about. The parse, OCR and join records and the error object also carry the `runId` that last wrote them, so the newer of a record and its error wins. An event, a link and a read record carry their runs in `history` instead.
 4. **One snapshot per store, refreshed by ETag.** A step lists the store, sixteen prefixes at once, compares each key's ETag with the one in its snapshot, and GETs only the keys that are new or changed. No step reads the bucket's modified times. No step GETs an object it already has.
 
 Carried over from the redesign:
@@ -59,20 +59,37 @@ parse/v4/
 
 ## 2. The shapes
 
-Eight shapes. Every object starts with `id`, the thing it is about. The read, parse, OCR and join records and the error object also carry `runId`, the run that last wrote them, so the newer of a record and its error can be told. An event and a link carry their runs in `history`. A type sits in angle brackets, a bar separates choices, and `n` is a number. Every field is present. A field with no value is `null`. No object carries a schema version: the folder version does, as today. Today's objects are in 2.9, for comparison.
+Eight shapes. Every object starts with `id`, the thing it is about. The parse, OCR and join records and the error object also carry `runId`, the run that last wrote them, so the newer of a record and its error can be told. An event, a link and a read record carry their runs in `history`. A type sits in angle brackets, a bar separates choices, and `n` is a number. Every field is present. A field with no value is `null`. No object carries a schema version: the folder version does, as today.
 
-The event and the link share one history entry. It is a union on `kind`. The first entry of a history is always `created`. A meeting or a document is current when the last of its `created`, `archived` and `unarchived` entries is not `archived`. The chain of a meeting starts at the `documentId` of its last `first-document` entry.
+Each object below is shown in the same order: its key, the object today, the object after, what changed, and when it is written.
+
+The event, the link and the read record share one history entry. It is a union on `kind`. A meeting or a document is current when the last of its `created`, `archived` and `unarchived` entries is not `archived`. The chain of a meeting starts at the `documentId` of its last `first-document` entry. `fetched` and `checked` belong to the read record. `fetched` carries the hash the bytes had, so a change of the file is in the history. `checked` is only the run. The type, size and ETag live at the top of the read record, to keep the entries small.
 
 ```
 { "kind": "created" | "updated" | "archived" | "unarchived", "runId": "<runId>" }
 { "kind": "first-document", "runId": "<runId>", "documentId": "<documentId>" }
+{ "kind": "fetched", "runId": "<runId>", "contentHash": "<hash>" }
+{ "kind": "checked", "runId": "<runId>" }
 ```
 
 ### 2.1 Event
 
 `list/v3/events/data/<eventId>.json`
 
-Written when the meeting is first seen, with a `created` entry. Rewritten only when something happens to the meeting itself, and each time one entry is added: `updated` when `title`, `date` or `url` change, `archived` when the meeting is gone from a page that loaded fine, `unarchived` when it is back, and `first-document` when the first document of the chain in 2.2 is set or changes. The first document is the meeting page, whose id is the hash of `url`, as today. For a source with no meeting page it is the first paper the source lists. A new paper never rewrites the event unless it becomes the first. Nothing at the top of the object changes without an entry that says when.
+Today, `list/v2/events/data/<eventId>.json`:
+
+```
+{
+  "id": "<eventId>",
+  "sourceId": "<id>",
+  "title": "<text>",
+  "date": "<date text>",
+  "url": "<url>",
+  "documents": [ { "id": "<id>", "title": "<text>", "url": "<url>" } ]
+}
+```
+
+After:
 
 ```
 {
@@ -85,11 +102,21 @@ Written when the meeting is first seen, with a `created` entry. Rewritten only w
 }
 ```
 
+What changed: `documents[]` is gone, and each document is a link object of its own, 2.2. `history` is added.
+
+Written when the meeting is first seen, with a `created` entry. Rewritten only when something happens to the meeting itself, and each time one entry is added: `updated` when `title`, `date` or `url` change, `archived` when the meeting is gone from a page that loaded fine, `unarchived` when it is back, and `first-document` when the first document of the chain is set or changes. The first document is the meeting page, whose id is the hash of `url`, as today. For a source with no meeting page it is the first paper the source lists. A new paper never rewrites the event unless it becomes the first. Nothing at the top of the object changes without an entry that says when.
+
 ### 2.2 Link
 
 `list/v3/events/data/<eventId>/documents/<documentId>.json`
 
-One per document of the meeting. Written when the document is first found, with a `created` entry. Rewritten with one entry added each time: `updated` when `title`, `url` or `nextDocumentId` change, `archived` when the page loaded fine and no longer links it, `unarchived` when it is back after that. The links of a meeting form a chain from the document the event's last `first-document` entry names. An archived link keeps its `nextDocumentId`, so the chain runs through it, and a reader leaves it out. Archiving the first document, or one in the middle, rewrites nothing.
+Today, one row of the event's `documents[]`:
+
+```
+{ "id": "<id>", "title": "<text>", "url": "<url>" }
+```
+
+After:
 
 ```
 {
@@ -100,6 +127,10 @@ One per document of the meeting. Written when the document is first found, with 
   "history": [ <HistoryEntry> ]
 }
 ```
+
+What changed: the row becomes an object of its own, beside the event. `nextDocumentId` and `history` are added.
+
+Written when the document is first found, with a `created` entry. Rewritten with one entry added each time: `updated` when `title`, `url` or `nextDocumentId` change, `archived` when the page loaded fine and no longer links it, `unarchived` when it is back after that. The links of a meeting form a chain from the document the event's last `first-document` entry names. An archived link keeps its `nextDocumentId`, so the chain runs through it, and a reader leaves it out. Archiving the first document, or one in the middle, rewrites nothing.
 
 A meeting page and two papers:
 
@@ -114,28 +145,47 @@ events/data/<eventId>/documents/<paper2Id>.json       nextDocumentId: null
 
 `read/v3/documents/data/<documentId>.json`, with the bytes at `read/v3/documents/bytes/<documentId>/<contentHash>`.
 
-Written on the first fetch. Rewritten on every fetch or check after that. The bytes are written once per hash. On a 304 the content fields stay, `outcome` is `same`, and `lastCheckedRunId` is this run.
+Today, `read/v2/documents/data/<documentId>`: the bytes only, with the content type on the object. No record is written. The schema has one, never used:
+
+```
+{ "id": "<documentId>", "contentHash": "<hash>", "contentType": "<type>" }
+```
+
+After:
 
 ```
 {
   "id": "<documentId>",
-  "runId": "<runId>",
   "contentHash": "<hash>",
-  "contentHashes": [ { "contentHash": "<hash>", "runId": "<runId>" } ],
   "contentType": "<type>",
   "byteCount": n,
   "etag": "<text>" | null,
-  "lastModified": "<text>" | null,
-  "outcome": "new" | "same" | "changed",
-  "lastCheckedRunId": "<runId>"
+  "history": [ <HistoryEntry> ]
 }
 ```
+
+What changed: the record is now written. The top holds the current file: its hash, type, size and the ETag for the next request. `history` holds every fetch and check, with the hash on each `fetched` entry, so every hash the file ever had is there with the run that saw it. The bytes move from the record's key to `bytes/<documentId>/<contentHash>`, one object per hash.
+
+Written on the first fetch, with a `fetched` entry. Rewritten on every fetch or check after that: a `fetched` entry when the bytes changed, with the new hash at the top, or a `checked` entry when they were the same, by a 304 or by the same hash.
 
 ### 2.4 Parse record
 
 `parse/v4/documents/data/<documentId>.json`, with the text at `parse/v4/documents/text/<documentId>/<contentHash>/<sdkVersion>.md` and the images at `parse/v4/documents/images/<documentId>/<contentHash>/<file>`.
 
-Written on the first parse. Rewritten on a re-parse, for a new hash or a new SDK. The old text stays under its own key. `leftOut` and `images` keep today's shape.
+Today, `parse/v3/documents/data/<documentId>.json`, with the text at `documents/text/<documentId>.md`, the images at `documents/images/<documentId>/<file>`, and a started marker `{ "id" }` at `documents/started/<documentId>.json`:
+
+```
+{
+  "id": "<documentId>",
+  "sdkVersion": "<version>",
+  "pageCount": n,
+  "scanPages": [ n ],
+  "leftOut": [ { "languageName": "<text>", "unitCount": n } ],
+  "images": [ { "fileName": "<text>", "pageNumber": n, "kind": "page" | "picture", "width": n, "height": n, "byteCount": n } ]
+}
+```
+
+After:
 
 ```
 {
@@ -151,11 +201,27 @@ Written on the first parse. Rewritten on a re-parse, for a new hash or a new SDK
 }
 ```
 
+What changed: added `runId`, `contentHash` and `textKey`. `leftOut` and `images` keep today's shape. The text and images move under the content hash and SDK version, so a re-parse never writes over them. The started marker is gone: the error object is written first instead, 2.7.
+
+Written on the first parse. Rewritten on a re-parse, for a new hash or a new SDK.
+
 ### 2.5 OCR record
 
 `ocr/v4/data/<documentId>.json`, with the text at `ocr/v4/text/<documentId>/<contentHash>/<sdkVersion>/<engineVersion>/<pagesReadCount>.md`.
 
-Written on the first scan. Rewritten on a re-scan, for a new hash, SDK, engine or page cap. The old text stays. The page lists keep today's shape.
+Today, `ocr/v3/data/<documentId>.json`, with the text at `ocr/v3/text/<documentId>.md`:
+
+```
+{
+  "id": "<documentId>",
+  "pagesRead": [ n ],
+  "pagesFailed": [ n ],
+  "pagesLeft": [ n ],
+  "leftOut": [ <as today> ]
+}
+```
+
+After:
 
 ```
 {
@@ -172,11 +238,17 @@ Written on the first scan. Rewritten on a re-scan, for a new hash, SDK, engine o
 }
 ```
 
+What changed: added `runId`, `contentHash`, `sdkVersion`, `engineVersion` and `textKey`. The page lists and `leftOut` keep today's shape. The text moves under the hash, the SDK version, the engine version and the count of pages read, so a re-scan never writes over it.
+
+Written on the first scan. Rewritten on a re-scan, for a new hash, SDK, engine or page cap.
+
 ### 2.6 Join record
 
 `join/v2/events/data/<eventId>.json`, with the file at `join/v2/events/files/<eventId>/<inputsHash>.md`.
 
-Written on the first build. Rewritten on each rebuild. The old file stays, so a judgment that cites it still points at what it judged. `textKeys` are the parse and OCR texts the file was built from, sorted. `inputsHash` is the hash of them plus the listing and the config, section 4.5.
+Today, `join/v1/events/data/<eventId>.md`: the file only, written over on each build. No record.
+
+After:
 
 ```
 {
@@ -188,11 +260,25 @@ Written on the first build. Rewritten on each rebuild. The old file stays, so a 
 }
 ```
 
+What changed: the record is new. The file moves to `events/files/<eventId>/<inputsHash>.md`, one object per build, so a rebuild never writes over it. `textKeys` are the parse and OCR texts the file was built from, sorted. `inputsHash` is the hash of them plus the listing and the config, section 4.5.
+
+Written on the first build. Rewritten on each rebuild.
+
 ### 2.7 Error
 
 `<store>/.../errors/<id>.json`, the same `errors/` keys as today.
 
-Rewritten on each failure, with `attempt` one higher. `attempt` starts at 1 again after a good object. `class` is a row of the retry rule in section 6. `url` is the page or file that failed, or `null` when the failure was not a request. `request` keeps today's `FailureEntry` for a request failure, and is `null` for a parse, scan or build failure. Parse and OCR write this object first, with class `cut-off`, and the data object after the work. The data object wins a tie on `runId`, so a crash in between leaves the error standing.
+Today, three shapes, each written over on the next failure:
+
+```
+list and read   { "id": "<id>", "failure": <FailureEntry> }
+parse and OCR   { "id": "<id>", "failure": { "failureClass": "<class>", "reason": "<text>" } }
+join            { "id": "<id>", "reason": "<text>" }
+```
+
+A `FailureEntry` has `url`, `hostKey`, `requestKind`, `failureClass`, `status`, `failedBy`, `browserResult`, `kind` and `reason`.
+
+After:
 
 ```
 {
@@ -206,11 +292,17 @@ Rewritten on each failure, with `attempt` one higher. `attempt` starts at 1 agai
 }
 ```
 
+What changed: one shape for every store. Added `runId`, `attempt` and `url`. `class` is today's `failureClass`, and a row of the retry rule in section 6. `request` keeps today's `FailureEntry` whole for a request failure, and is `null` for a parse, scan or build failure.
+
+Rewritten on each failure, with `attempt` one higher. `attempt` starts at 1 again after a good object. Parse and OCR write this object first, with class `cut-off`, and the data object after the work. The data object wins a tie on `runId`, so a crash in between leaves the error standing.
+
 ### 2.8 Snapshot
 
 `<store>/snapshot/<runId>.json`
 
-One per store. Written at the end of a run that changed something. It holds every data and error object of the store, by key, with the ETag the listing gave for that key. Content is not in it. A link or an event is current when the last of its `created`, `archived` and `unarchived` entries is not `archived`. An archived link still takes part in the chain through its `nextDocumentId`. A thing is in a failed state when its error's `runId` is newer than its data object's, or it has no data object.
+Today: none. A step lists `data/` and `errors/` of each store it reads, and the read step downloads every event record.
+
+After:
 
 ```
 {
@@ -222,51 +314,9 @@ One per store. Written at the end of a run that changed something. It holds ever
 }
 ```
 
-### 2.9 Today's objects, for comparison
+What changed: new. One per store. It holds every data and error object of the store, by key, with the ETag the listing gave for that key. Content is not in it. A link or an event is current when the last of its `created`, `archived` and `unarchived` entries is not `archived`. An archived link still takes part in the chain through its `nextDocumentId`. A thing is in a failed state when its error's `runId` is newer than the last run of its data object, which is its `runId` or the last entry of its history, or it has no data object.
 
-`list/v2/events/data/<eventId>.json`, written over on every run:
-
-```
-{
-  "id": "<eventId>",
-  "sourceId": "<id>",
-  "title": "<text>",
-  "date": "<date text>",
-  "url": "<url>",
-  "documents": [ { "id": "<id>", "title": "<text>", "url": "<url>" } ]
-}
-```
-
-`read/v2/documents/data/<documentId>`: the bytes only, with the content type on the object. No record.
-
-`parse/v3/documents/data/<documentId>.json`, with a started marker `{ "id" }` beside it:
-
-```
-{
-  "id": "<documentId>",
-  "sdkVersion": "<version>",
-  "pageCount": n,
-  "scanPages": [ n ],
-  "leftOut": [ { "languageName": "<text>", "unitCount": n } ],
-  "images": [ { "fileName": "<text>", "pageNumber": n, "kind": "page" | "picture", "width": n, "height": n, "byteCount": n } ]
-}
-```
-
-`ocr/v3/data/<documentId>.json`:
-
-```
-{
-  "id": "<documentId>",
-  "pagesRead": [ n ],
-  "pagesFailed": [ n ],
-  "pagesLeft": [ n ],
-  "leftOut": [ <as today> ]
-}
-```
-
-`join/v1/events/data/<eventId>.md`: the file only. No record.
-
-Errors, three shapes: list and read `{ "id", "failure": <FailureEntry> }`, parse and OCR `{ "id", "failure": { "failureClass", "reason" } }`, join `{ "id", "reason" }`. A `FailureEntry` has `url`, `hostKey`, `requestKind`, `failureClass`, `status`, `failedBy`, `browserResult`, `kind` and `reason`.
+Written at the end of a run that changed something.
 
 ## 3. Why this shape and not the obvious ones
 
@@ -294,12 +344,12 @@ Errors, three shapes: list and read `{ "id", "failure": <FailureEntry> }`, parse
 **What is due**: a current document in the list snapshot where one holds:
 
 - it has no read record, or
-- its `lastCheckedRunId` is older than `read.recheckInDays`, its event is in the feed window, and it has an `etag` or a `lastModified`, or
+- the last entry of its history is older than `read.recheckInDays`, its event is in the feed window, and it has an `etag`, or
 - it is in a failed state and the retry rule says its time has come.
 
-**What it writes.** The bytes to `documents/bytes/<documentId>/<contentHash>`, once per hash, and the read record. A conditional request that gets 304 rewrites the record with `outcome: same` and this run in `lastCheckedRunId`, with no download. This closes gap 1 at low cost. A failed fetch writes the error object with the document's address in `url`.
+**What it writes.** The bytes to `documents/bytes/<documentId>/<contentHash>`, once per hash, and the read record. A conditional request that gets 304 adds a `checked` entry to the record, with no download. This closes gap 1 at low cost. A failed fetch writes the error object with the document's address in `url`.
 
-**The recheck needs two things that do not exist yet.** The HTTP client must send `If-None-Match` and `If-Modified-Since` and return a 304 as a result, not a failure. The browser fallback fetches through a real browser, so it does no recheck. A document with no validator is not rechecked, and a metric counts those, so the size of that hole is known.
+**The recheck needs two things that do not exist yet.** The HTTP client must send `If-None-Match` and return a 304 as a result, not a failure. The browser fallback fetches through a real browser, so it does no recheck. A document with no ETag is not rechecked, and a metric counts those, so the size of that hole is known. `Last-Modified` is not used: it is the weaker validator, and one field fewer.
 
 ### 4.3 Parse
 
@@ -399,9 +449,9 @@ Nothing is parked for ever by code: a release that raises a number makes the par
 | Question | How |
 | --- | --- |
 | When did we first see document D in meeting M? | D's link: the `created` entry in its history. One GET. |
-| What happened to D, in order? | D's link history, then D's read record, whose `contentHashes` name every version of the file and the run that saw it, then the `runId` on its parse and OCR records. |
-| Did the council change the file? | D's read record: `contentHashes` has two entries. |
-| Did we check D lately and find it the same? | D's read record: `outcome: same` and `lastCheckedRunId`. Only the last check is kept. |
+| What happened to D, in order? | D's link history, then D's read record history, which has every fetch and check with its run, then the `runId` on its parse and OCR records. |
+| Did the council change the file? | D's read record: two `fetched` entries with different hashes. |
+| Did we check D lately and find it the same? | D's read record: the last `checked` entry. Every check is kept. |
 | Why is D marked gone? | D's link: the last `archived` entry names the run. That run's log has the page that no longer linked it. |
 | What did meeting file M get built from? | The join record's `textKeys`. |
 | What changed since Tuesday? | Snapshots are kept. Compare Tuesday's with the newest: every key whose ETag differs changed. |
@@ -451,7 +501,7 @@ Each step keeps three things of its own: its object shapes, what it writes, and 
 Each item stands on its own and is a run's worth of checking.
 
 1. `ObjectBucket.readObjectEntries` with ETags over sixteen prefixes at once. `createRunContext`. `createStoreSnapshot` with the ETag diff, the `id` and `runId` fields, the error object, the snapshot, `readNextTry`, and the rebuild tool. The property test. No step uses it yet.
-2. Conditional requests in the HTTP client: send the validators, return 304 as a result.
+2. Conditional requests in the HTTP client: send `If-None-Match`, return 304 as a result.
 3. List on `list/v3` and read on `read/v3` together, so listings keep flowing: events and links with history and the chain, scopes, the new own-site event id; bytes by hash and read records. A migration tool copies the old read store's bytes under each document by hash and writes one read record per document under run id `20261101T000000Z-migrate`. No content hash is stored today, and a bucket listing gives an ETag, not a SHA-256, so the tool must download every blob once. Run it as a Cloud Run job in the bucket's region, where reads from the bucket have no network charge. Old folders stay.
 4. Parse on `parse/v4` and OCR on `ocr/v4`: content under the document by hash and version, `cut-off` first, work from snapshots. The same migration tool writes parse and OCR records for what exists, with the SDK version each record saved.
 5. Join as its own step on `join/v2`, with the inputs hash and the file under `files/`.
@@ -462,7 +512,7 @@ Each item stands on its own and is a run's worth of checking.
 
 1. The sizes in section 5 are estimates from the schemas and from the list step's counts. Build step 1, build the development list snapshot once, and time one listing of `events/data/`.
 2. That Google Cloud Storage returns the ETag in an S3-style listing, and that Bun's client passes it through. The type in Bun 1.4.2 has the field. One call against the development bucket confirms it.
-3. How many councils send `ETag` or `Last-Modified` with a document. The read step can log the headers for one run. This sets how much of gap 1 the recheck really closes.
+3. How many councils send an `ETag` with a document. The read step can log the headers for one run. This sets how much of gap 1 the recheck really closes. A document with only `Last-Modified` is not rechecked in this design. If the log shows many, add `lastModified` to the `fetched` entry.
 4. Which own-site sources split by date, and so which events change id. The migration tool reports it.
 5. The size of the old read store in bytes, which sets the time of the migration job.
 6. Bytes and text under the document, not under a shared hash folder, means the same file at two addresses is stored and parsed twice. That is today's behaviour. It keeps everything about a document in one place. Measure how often it happens before deciding it matters.
