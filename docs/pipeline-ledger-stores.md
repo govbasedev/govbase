@@ -47,7 +47,7 @@ Picture of the list store and the parse store:
 ```
 list/v3/
   events/data/<eventId>.json                 the meeting: id, source, title, date, url, history
-  events/data/<eventId>/documents/<documentId>.json   one link per document: id, title, url, next document, history
+  events/data/<eventId>/documents/<documentId>.json   one link per document: id, event, title, url, next document, history
   events/errors/<pageId>.json                the last failure of a page, as today
   snapshot/<runId>.json
 
@@ -55,13 +55,13 @@ parse/v4/
   documents/data/<documentId>.json
   documents/errors/<documentId>.json
   documents/text/<documentId>/<contentHash>/<sdkVersion>.md
-  documents/images/<documentId>/<contentHash>/<file>.png
+  documents/images/<documentId>/<contentHash>/<sdkVersion>/<file>.png
   snapshot/<runId>.json
 ```
 
 ## 2. The shapes
 
-Eight shapes. Every object starts with `id`, the thing it is about, and ends with `history`, which holds its runs. No object has a run id at the top. A type sits in angle brackets, a bar separates choices, and `n` is a number. Every field is present. A field with no value is `null`. No object carries a schema version: the folder version does, as today.
+Eight shapes. Every object starts with `id`, the thing it is about, and ends with `history`, which holds its runs. No object has a run id at the top. A key an object names is the full bucket key, store prefix included, so it means the same thing wherever it is read. A type sits in angle brackets, a bar separates choices, and `n` is a number. Every field is present. A field with no value is `null`. No object carries a schema version: the folder version does, as today.
 
 Each object below is shown in the same order: its key, the object today, the object after, what changed, and when it is written.
 
@@ -106,7 +106,7 @@ After:
 
 What changed: `documents[]` is gone, and each document is a link object of its own, 2.2. `history` is added.
 
-Written when the meeting is first seen, with a `created` entry. Rewritten only when something happens to the meeting itself, and each time one entry is added: `updated` when `title`, `date` or `url` change, `archived` when the meeting is gone from a page that loaded fine, `unarchived` when it is back, and `first-document` when the first document of the chain is set or changes. The first document is the meeting page, whose id is the hash of `url`, as today. For a source with no meeting page it is the first paper the source lists. A new paper never rewrites the event unless it becomes the first. Nothing at the top of the object changes without an entry that says when. The first entry is `created`. The meeting is current when the last of its `created`, `archived` and `unarchived` entries is not `archived`. The chain of its documents starts at the `documentId` of its last `first-document` entry.
+Written when the meeting is first seen, with a `created` entry. Rewritten only when something happens to the meeting itself, and each time one entry is added: `updated` when `title`, `date` or `url` change, `archived` when the meeting is gone from a page that loaded fine, `unarchived` when it is back, and `first-document` when the first document of the chain is set or changes. The first document is the meeting page, whose id is the hash of `url`, as today. For a source with no meeting page it is the first paper the source lists, and `url` is the page the meeting was listed on. A new paper never rewrites the event unless it becomes the first. Nothing at the top of the object changes without an entry that says when. The first entry is `created`. The meeting is current when the last of its `created`, `archived` and `unarchived` entries is not `archived`. The chain of its documents starts at the `documentId` of its last `first-document` entry.
 
 ### 2.2 Link
 
@@ -123,6 +123,7 @@ After:
 ```
 {
   "id": "<documentId>",
+  "eventId": "<eventId>",
   "title": "<text>",
   "url": "<url>",
   "nextDocumentId": "<id>" | null,
@@ -136,7 +137,7 @@ After:
 { "kind": "created" | "updated" | "archived" | "unarchived", "runId": "<runId>" }
 ```
 
-What changed: the row becomes an object of its own, beside the event. `nextDocumentId` and `history` are added.
+What changed: the row becomes an object of its own, beside the event. `eventId`, `nextDocumentId` and `history` are added. `eventId` is the meeting the link belongs to, which only the key said before. `nextDocumentId` always names a link of the same meeting.
 
 Written when the document is first found, with a `created` entry. Rewritten with one entry added each time: `updated` when `title`, `url` or `nextDocumentId` change, `archived` when the page loaded fine and no longer links it, `unarchived` when it is back after that. The links of a meeting form a chain from the document the event's last `first-document` entry names. An archived link keeps its `nextDocumentId`, so the chain runs through it, and a reader leaves it out. Archiving the first document, or one in the middle, rewrites nothing. The first entry is `created`. The document is current when the last of its `created`, `archived` and `unarchived` entries is not `archived`.
 
@@ -165,6 +166,7 @@ After:
 {
   "id": "<documentId>",
   "contentHash": "<hash>",
+  "bytesKey": "read/v3/documents/bytes/<documentId>/<contentHash>",
   "contentType": "<type>",
   "byteCount": n,
   "etag": "<text>" | null,
@@ -179,13 +181,13 @@ After:
 { "kind": "checked", "runId": "<runId>" }
 ```
 
-What changed: the record is now written. The top holds the current file: its hash, type, size and the ETag for the next request. `history` holds every fetch and check, with the hash on each `fetched` entry, so every hash the file ever had is there with the run that saw it. The bytes move from the record's key to `bytes/<documentId>/<contentHash>`, one object per hash.
+What changed: the record is now written. The top holds the current file: its hash, type, size and the ETag for the next request. `history` holds every fetch and check, with the hash on each `fetched` entry, so every hash the file ever had is there with the run that saw it. The bytes move from the record's key to `bytesKey`, one object per hash.
 
 Written on the first fetch, with a `fetched` entry. Rewritten on every fetch or check after that: a `fetched` entry when the bytes changed, with the new hash at the top, or a `checked` entry when they were the same, by a 304 or by the same hash.
 
 ### 2.4 Parse record
 
-`parse/v4/documents/data/<documentId>.json`, with the text at `parse/v4/documents/text/<documentId>/<contentHash>/<sdkVersion>.md` and the images at `parse/v4/documents/images/<documentId>/<contentHash>/<file>`.
+`parse/v4/documents/data/<documentId>.json`, with the text at `parse/v4/documents/text/<documentId>/<contentHash>/<sdkVersion>.md` and the images at `parse/v4/documents/images/<documentId>/<contentHash>/<sdkVersion>/<file>`.
 
 Today, `parse/v3/documents/data/<documentId>.json`, with the text at `documents/text/<documentId>.md`, the images at `documents/images/<documentId>/<file>`, and a started marker `{ "id" }` at `documents/started/<documentId>.json`:
 
@@ -207,7 +209,8 @@ After:
   "id": "<documentId>",
   "contentHash": "<hash>",
   "sdkVersion": "<version>",
-  "textKey": "documents/text/<documentId>/<contentHash>/<sdkVersion>.md",
+  "textKey": "parse/v4/documents/text/<documentId>/<contentHash>/<sdkVersion>.md",
+  "imagesPrefix": "parse/v4/documents/images/<documentId>/<contentHash>/<sdkVersion>/",
   "pageCount": n,
   "scanPages": [ n ],
   "leftOut": [ <as today> ],
@@ -222,7 +225,7 @@ After:
 { "kind": "parsed", "runId": "<runId>", "contentHash": "<hash>", "sdkVersion": "<version>" }
 ```
 
-What changed: added `contentHash`, `textKey` and `history`. The top is the newest parse. Each `parsed` entry names the bytes and the SDK of one parse, so every text that exists for the document is in the history. `leftOut` and `images` keep today's shape. The text and images move under the content hash and SDK version, so a parse never writes over another. The started marker is gone: the error object is written first instead, 2.7.
+What changed: added `contentHash`, `textKey`, `imagesPrefix` and `history`. An image's key is `imagesPrefix` plus its `fileName`. The top is the newest parse. Each `parsed` entry names the bytes and the SDK of one parse, so every text that exists for the document is in the history. `leftOut` and `images` keep today's shape. The text and images move under the content hash and SDK version, so a parse never writes over another. The started marker is gone: the error object is written first instead, 2.7.
 
 One `parsed` entry per parse.
 
@@ -254,7 +257,7 @@ After:
   "pagesFailed": [ n ],
   "pagesLeft": [ n ],
   "leftOut": [ <as today> ],
-  "textKey": "text/<documentId>/<contentHash>/<sdkVersion>/<engineVersion>/<pagesReadCount>.md",
+  "textKey": "ocr/v4/text/<documentId>/<contentHash>/<sdkVersion>/<engineVersion>/<pagesReadCount>.md",
   "history": [ <OcrEntry> ]
 }
 ```
@@ -265,7 +268,7 @@ After:
 { "kind": "scanned", "runId": "<runId>", "contentHash": "<hash>", "sdkVersion": "<version>", "engineVersion": "<version>", "pagesReadCount": n }
 ```
 
-What changed: added `contentHash`, `sdkVersion`, `engineVersion`, `textKey` and `history`. The top is the newest scan. Each `scanned` entry names the bytes, SDK, engine and pages read of one scan, so every OCR text that exists is in the history. The page lists and `leftOut` keep today's shape. The text moves under the hash, the SDK version, the engine version and the count of pages read, so a scan never writes over another.
+What changed: added `contentHash`, `sdkVersion`, `engineVersion`, `textKey` and `history`. `sdkVersion` is the parse record's: the version that made the text the scan was merged into. `engineVersion` is one string the SDK exports for its OCR: the Tesseract build, the language model and the SDK's own reading rules. The SDK changes it only when the text it would produce changes, so a bump re-scans everything once, and nothing else does. The top is the newest scan. Each `scanned` entry names the bytes, SDK, engine and pages read of one scan, so every OCR text that exists is in the history. The page lists and `leftOut` keep today's shape. The text moves under the hash, the SDK version, the engine version and the count of pages read, so a scan never writes over another.
 
 One `scanned` entry per scan.
 
@@ -281,7 +284,7 @@ After:
 {
   "id": "<eventId>",
   "inputsHash": "<hash>",
-  "fileKey": "events/files/<eventId>/<inputsHash>.md",
+  "fileKey": "join/v2/events/files/<eventId>/<inputsHash>.md",
   "textKeys": [ "<key>" ],
   "history": [ <JoinEntry> ]
 }
@@ -293,13 +296,13 @@ After:
 { "kind": "joined", "runId": "<runId>", "inputsHash": "<hash>" }
 ```
 
-What changed: the record is new. The top is the newest build. Each `joined` entry names the inputs hash of one build, so every file that exists is in the history. The file moves to `events/files/<eventId>/<inputsHash>.md`, one object per build, so a build never writes over another. `textKeys` are the parse and OCR texts the file was built from, sorted. `inputsHash` is the hash of them plus the listing and the config, section 4.5.
+What changed: the record is new. The top is the newest build. Each `joined` entry names the inputs hash of one build, so every file that exists is in the history. The file moves to `join/v2/events/files/<eventId>/<inputsHash>.md`, one object per build, so a build never writes over another. `textKeys` are the parse and OCR texts the file was built from, in chain order. `inputsHash` is the hash of everything the file was built from, section 4.5.
 
 One `joined` entry per build.
 
 ### 2.7 Error
 
-`<store>/.../errors/<id>.json`, the same `errors/` keys as today.
+One per store, beside its records: `list/v3/events/errors/<pageId>.json`, `read/v3/documents/errors/<documentId>.json`, `parse/v4/documents/errors/<documentId>.json`, `ocr/v4/errors/<documentId>.json` and `join/v2/events/errors/<eventId>.json`.
 
 Today, three shapes, each written over on the next failure:
 
@@ -316,6 +319,7 @@ After:
 ```
 {
   "id": "<id>",
+  "sourceId": "<id>" | null,
   "class": "<class>",
   "reason": "<text>",
   "url": "<url>" | null,
@@ -330,7 +334,7 @@ After:
 { "kind": "failed", "runId": "<runId>", "class": "<class>" }
 ```
 
-What changed: one shape for every store. Added `url` and `history`. The top is the latest failure. `class` is today's `failureClass`, and a row of the retry rule in section 6. `request` keeps today's `FailureEntry` whole for a request failure, and is `null` for a parse, scan or build failure.
+What changed: one shape for every store. Added `sourceId`, `url` and `history`. `sourceId` is set where the step knows the council, in list and read, and `null` in parse, OCR and join. The top is the latest failure. `class` is today's `failureClass`, and a row of the retry rule in section 6. `request` keeps today's `FailureEntry` whole for a request failure, and is `null` for a parse, scan or build failure.
 
 One `failed` entry per failure. A thing is in a failed state when the last entry of its error object is newer than the last entry of its record, or it has no record. The tries since the last good object are the `failed` entries newer than the record's last entry. Parse and OCR write this object first, with class `cut-off`, and the record after the work. The record wins a tie, so a crash in between leaves the error standing.
 
@@ -385,7 +389,7 @@ Written at the end of a run that changed something.
 - the last entry of its history is older than `read.recheckInDays`, its event is in the feed window, and it has an `etag`, or
 - it is in a failed state and the retry rule says its time has come.
 
-**What it writes.** The bytes to `documents/bytes/<documentId>/<contentHash>`, once per hash, and the read record. A conditional request that gets 304 adds a `checked` entry to the record, with no download. This closes gap 1 at low cost. A failed fetch writes the error object with the document's address in `url`.
+**What it writes.** The bytes to `read/v3/documents/bytes/<documentId>/<contentHash>`, once per hash, and the read record. A conditional request that gets 304 adds a `checked` entry to the record, with no download. This closes gap 1 at low cost. A failed fetch writes the error object with the document's address in `url`.
 
 **The recheck needs two things that do not exist yet.** The HTTP client must send `If-None-Match` and return a 304 as a result, not a failure. The browser fallback fetches through a real browser, so it does no recheck. A document with no ETag is not rechecked, and a metric counts those, so the size of that hole is known. `Last-Modified` is not used: it is the weaker validator, and one field fewer.
 
@@ -393,7 +397,7 @@ Written at the end of a run that changed something.
 
 **What is due**: a document with no `parsed` entry for its read record's `contentHash` and the current `sdkVersion`, and that is not parked. A file that goes back to bytes already parsed is not parsed again, because its text is still there.
 
-**What it writes.** The error object with class `cut-off` first. Then the text at `documents/text/<documentId>/<contentHash>/<sdkVersion>.md`, the images at `documents/images/<documentId>/<contentHash>/<file>`, and the parse record. On a text failure, the error object again with the text failure class.
+**What it writes.** It reads the bytes at the read record's `bytesKey`. The error object with class `cut-off` first. Then the text at `parse/v4/documents/text/<documentId>/<contentHash>/<sdkVersion>.md`, the images at `parse/v4/documents/images/<documentId>/<contentHash>/<sdkVersion>/<file>`, and the parse record. On a text failure, the error object again with the text failure class.
 
 An SDK upgrade makes every document due again by itself. `parse.redoShare` caps how many redo items a run takes, oldest meeting last, so the cloud job is not flooded. Gap 5 closes.
 
@@ -401,11 +405,11 @@ An SDK upgrade makes every document due again by itself. `parse.redoShare` caps 
 
 ### 4.4 OCR
 
-**What is due**: a document whose parse record has scan pages, and that has no `scanned` entry for its `contentHash`, the current `sdkVersion` and the current `engineVersion`, or whose newest scan has pages left and fewer pages read than `ocr.maxImagePages`. And it is not parked. So raising the cap makes the pages left due, and lowering it does nothing.
+**What is due**: a document whose parse record has scan pages, and that has no `scanned` entry for the parse record's `contentHash` and `sdkVersion` and the current `engineVersion`, or whose newest scan has pages left and fewer pages read than `ocr.maxImagePages`. And it is not parked. So raising the cap makes the pages left due, and lowering it does nothing.
 
-The step finds its work from the parse snapshot, never by listing the images. Gap 7's double image listing goes. If an image is missing, the step writes a `bytes-missing` error, so gap 10 closes.
+The step finds its work from the parse snapshot, never by listing the images. It reads each page image at the parse record's `imagesPrefix` plus the image's `fileName`, and the parse text at its `textKey`. Gap 7's double image listing goes. If an image is missing, the step writes a `bytes-missing` error, so gap 10 closes.
 
-**What it writes.** The `cut-off` error first, then the text at `text/<documentId>/<contentHash>/<sdkVersion>/<engineVersion>/<pagesReadCount>.md` and the OCR record, with a `scanned` entry.
+**What it writes.** The `cut-off` error first, then the text at `ocr/v4/text/<documentId>/<contentHash>/<sdkVersion>/<engineVersion>/<pagesReadCount>.md` and the OCR record, with a `scanned` entry.
 
 **Shares.** A filter over the due list, like parse. The rule is free to change: the split by page count in `pipeline-ocr-efficiency.md` fits, because every task sees the same snapshot.
 
@@ -413,11 +417,13 @@ The step finds its work from the parse snapshot, never by listing the images. Ga
 
 The join is its own step, after OCR, with its own store `join/v2`. This closes gap 11. Its snapshot is what the viewer and the judge read.
 
-**What is due**: an event with no `joined` entry for its current `inputsHash`. A listing that goes back to an earlier state is not rebuilt, because that file is still there. `inputsHash` is the hash of the sorted list of keys the file would be built from: the event's current documents in chain order, each document's parse text key, each OCR text key, the config values `coverShare` and `wordsPerRun`, and the SDK version. No times. No race. A change to any input, the listing included, makes the event due. Gap 5's missed changes close.
+**What is due**: an event with no `joined` entry for its current `inputsHash`. A listing that goes back to an earlier state is not rebuilt, because that file is still there. `inputsHash` is the hash of everything the file is built from, in the order it is built: the event's `title`, `date` and `url`; then for each current document in chain order, its `title`, its parse text key or its error class when it has no parse record, and its OCR text key when the rule below allows it, or `null`; then the config values `coverShare` and `wordsPerRun`, and the SDK version. The list is not sorted, so a reordered meeting is rebuilt, and so is a corrected title. No times. No race. A change to any input, the listing included, makes the event due. Gap 5's missed changes close.
+
+**Which text.** For each document the join uses the OCR text when the OCR record's `contentHash` and `sdkVersion` equal the parse record's, and the parse text otherwise. An OCR record from an older parse is ignored until the scan catches up, and the inputs hash changes when it does. That closes the old-text case in gap B4.
 
 **Document order.** The join starts at the document the event's last `first-document` entry names and follows `nextDocumentId` through every link, archived ones included, until `null` or an id it has already seen. Archived links are left out of the file. A current document the chain did not reach goes at the end, by title. No pointer mistake loses a document.
 
-**What it writes.** The file at `events/files/<eventId>/<inputsHash>.md` and the join record, with a `joined` entry. A failed build writes the error object.
+**What it writes.** The file at `join/v2/events/files/<eventId>/<inputsHash>.md` and the join record, with a `joined` entry. A failed build writes the error object.
 
 **Readers outside the chain.** The document viewer reads the list, parse, OCR and join snapshots. Its folder constants in `labelStore.mjs` become the four snapshot prefixes.
 
@@ -504,7 +510,7 @@ Every answer is a GET in the bucket console, or a tool over two snapshots.
 | The run id | `createRunContext` | every step |
 | Listing with ETags, sixteen prefixes at once | `ObjectBucket.readObjectEntries` | `createStoreSnapshot` |
 | Find the newest snapshots, read them, list and diff by ETag, GET the changes, save the snapshot | `createStoreSnapshot` | every step |
-| The `id` field, the history entry, the error object and the snapshot shape | `createStoreSnapshot.schema.ts` | every step |
+| The `id` field, the history entries, the error object and the snapshot shape | `createStoreSnapshot.schema.ts` | every step |
 | The retry rule | `readNextTry` | read, parse, OCR, join |
 | Share filter | `readIsOwnShare` | parse, OCR |
 | Content keys by hash and version | `buildContentKey` | read, parse, OCR, join |
@@ -538,7 +544,7 @@ Each step keeps three things of its own: its object shapes, what it writes, and 
 
 Each item stands on its own and is a run's worth of checking.
 
-1. `ObjectBucket.readObjectEntries` with ETags over sixteen prefixes at once. `createRunContext`. `createStoreSnapshot` with the ETag diff, the `id` field, the history entry, the error object, the snapshot, `readNextTry`, and the rebuild tool. The property test. No step uses it yet.
+1. `ObjectBucket.readObjectEntries` with ETags over sixteen prefixes at once. `createRunContext`. `createStoreSnapshot` with the ETag diff, the `id` field, the history entries, the error object, the snapshot, `readNextTry`, and the rebuild tool. The property test. No step uses it yet.
 2. Conditional requests in the HTTP client: send `If-None-Match`, return 304 as a result.
 3. List on `list/v3` and read on `read/v3` together, so listings keep flowing: events and links with history and the chain, scopes, the new own-site event id; bytes by hash and read records. A migration tool copies the old read store's bytes under each document by hash and writes one read record per document under run id `20261101T000000Z-migrate`. No content hash is stored today, and a bucket listing gives an ETag, not a SHA-256, so the tool must download every blob once. Run it as a Cloud Run job in the bucket's region, where reads from the bucket have no network charge. Old folders stay.
 4. Parse on `parse/v4` and OCR on `ocr/v4`: content under the document by hash and version, `cut-off` first, work from snapshots. The same migration tool writes parse and OCR records for what exists, with the SDK version each record saved.
@@ -556,4 +562,6 @@ Each item stands on its own and is a run's worth of checking.
 6. Bytes and text under the document, not under a shared hash folder, means the same file at two addresses is stored and parsed twice. That is today's behaviour. It keeps everything about a document in one place. Measure how often it happens before deciding it matters.
 7. The retry numbers are constants in domain code. The house-style rule `value-lives-in-config` fails on a number the code chose, so they need adding to `allowedNumbers`, which is the owner's permission to give.
 8. Whether to guard the no-overlap rule in code. The schedule may be guard enough.
-9. Nothing here was run. The first safe test is step 1 with the property test and the rebuild tool. Then step 3 on the development bucket, run twice: the second run writes no object and no snapshot.
+9. The parser SDK must export one OCR version string for `engineVersion`, and change it only when its OCR text would change. Nothing exposes it today.
+10. The snapshot stays, decided on 28 October 2026. If its size bites, two lighter forms are known: a lean snapshot that holds keys, ETags and only the fields the due rules read, with full objects fetched by the readers that need them; and a split by the first hex character of the id. Neither is needed on day one.
+11. Nothing here was run. The first safe test is step 1 with the property test and the rebuild tool. Then step 3 on the development bucket, run twice: the second run writes no object and no snapshot.
