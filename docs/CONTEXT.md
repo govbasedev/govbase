@@ -50,7 +50,7 @@ _Avoid_: member of the public, third party
 
 **Issue**:
 A national policy question that many councils respond to and can take a position on, such as local government reorganisation or devolution. An item can be about none, one, or several issues.
-_Avoid_: topic, theme, subject
+_Avoid_: theme, subject
 
 **Programme**:
 A named group of related issues that an analyst can follow together, such as English devolution and local government reorganisation.
@@ -58,7 +58,11 @@ _Avoid_: issue group, umbrella issue
 
 **Service area**:
 A field of council work with no position attached, such as contracts or temporary accommodation. An item has one main service area.
-_Avoid_: topic, department, category
+_Avoid_: department, category
+
+**Topic**:
+A broad subject that councils discuss, such as roads or the cost of living, named in `apps/pipeline/config/topics.yaml` with the plain phrases that stand for it. A topic has no position attached. An item can mention any number of topics, and the pipeline counts the mentions.
+_Avoid_: tag, category
 
 **Mentions**:
 An item mentions an issue when a word for the issue appears anywhere in its evidence. Mentioning says nothing about what the item is for.
