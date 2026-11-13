@@ -59,6 +59,16 @@ working folder or above it. `make check-agents` fails if one appears.
     artifact, such as a Claude Doc or a claude.ai page. When the user
     asks for a doc, an explanation to keep, or notes on code, write
     a file in `docs/`, and give the user its path.
+11. As an agent, after you change code in an app and its checks pass,
+    start a separate agent to review the change as a staff software
+    engineer, before you tell the user the work is done. Give that
+    agent the diff, the app's `AGENTS.md` and the spec, and not your
+    own conclusions. Ask it for correctness bugs and races, efficiency
+    improvements, behaviour an operator would not expect, breaks of the
+    house rules that lint does not catch, and gaps in the tests. Fix
+    each finding, or say why you did not. In your reply to the user,
+    list what the review found, what you fixed and what is left open.
+    A change to documents only needs no review.
 
 ## The name
 
