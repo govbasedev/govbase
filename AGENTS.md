@@ -11,7 +11,7 @@ documents.
 | `apps/parser-sdk`      | parser-sdk        | TypeScript, on Bun |
 | `apps/browser`         | browser           | TypeScript, on Bun |
 | `apps/relay`           | relay             | nginx config, bash |
-| `apps/document-viewer` | document-viewer   | JavaScript, on Bun |
+| `apps/site`            | site              | TypeScript, on Bun, with Astro |
 
 Each app folder is its own git repository. The workspace repository
 ignores them. The workspace tracks this file, `README.md`, `Makefile`,

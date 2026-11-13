@@ -64,5 +64,5 @@ The port, both adapters, the config, the metric `govbase_pipeline_runs_skipped`,
 ## What is left
 
 - The notification rules for the dev jobs, one per step.
-- The share-run rule: after a many-task run, the one-task run that writes the snapshot must be the one that fires the next step.
+- The share-run rule: after a many-task run, the one-task run that writes the snapshot must be the one that fires the next step. Done on 12 November 2026 for the hand-started chain: `runChain.sh` starts the one-task run after each sharded step, and a one-share parse or OCR run with nothing to do still writes the snapshot.
 - The production job still runs an old image.

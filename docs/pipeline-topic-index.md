@@ -1,5 +1,8 @@
 # A topic index for the topics app
 
+> Note, 12 November 2026: the index step this document led to was retired. The site reads the list, parse, OCR and topic snapshots and builds the topic pages itself.
+
+
 As of 30 October 2026.
 
 ## The question

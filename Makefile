@@ -3,7 +3,7 @@
 
 GITHUB_ORG   ?=
 APPS_DIR     := apps
-REPOS        := $(addprefix $(APPS_DIR)/,pipeline parser-sdk browser relay document-viewer)
+REPOS        := $(addprefix $(APPS_DIR)/,pipeline parser-sdk browser relay site)
 PRESENT      := $(wildcard $(REPOS))
 
 .PHONY: help clone pull status install check check-agents
