@@ -48,9 +48,11 @@ half the data is agendas for meetings that have not happened yet.
   its link title and keeps page order. The meeting page markdown holds
   the agenda table with item numbers, item titles and links to each
   paper.
-- **Topic counts.** Every paper has a count for every topic in three
-  zones: the link title, the heading lines, and the body text. A zone is
-  one part of a paper, counted on its own.
+- **Topic counts.** Every paper has a count for each topic it mentions,
+  in three zones: the link title, the heading lines, and the body text.
+  A zone is one part of a paper, counted on its own. A topic that is not
+  in a paper's record has no hit; records counted before 14 November
+  2026 list every topic, zeros included.
 - **Council facts.** `sources.yaml` gives each council a display name,
   an ONS code, a nation (England 317, Scotland 32, Wales 22, Northern
   Ireland 11), a parent council, its website and a licence. Every
